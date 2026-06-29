@@ -1,3 +1,5 @@
+// Author: Seongwoo Kim
+
 import { serializeFromGraph } from './btXmlSerializer';
 import { parseBTXml } from './btTreeParser';
 

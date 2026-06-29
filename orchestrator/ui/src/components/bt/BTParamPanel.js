@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Author: Claude (generated)
+// Author: Seongwoo Kim
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { useDispatch } from 'react-redux';
+import { useDispatch, useSelector } from 'react-redux';
 import { MdClose, MdFolderOpen } from 'react-icons/md';
 import FileBrowserModal from '../FileBrowserModal';
 import { setSelectedNodeId } from '../../features/btmanager/btmanagerSlice';
@@ -23,8 +23,54 @@ import { DEFAULT_PATHS } from '../../constants/paths';
 
 const NUMBER_PARAMS = new Set([
   'duration', 'angle_deg', 'lift_position', 'control_hz', 'inference_hz',
-  'chunk_align_window_s', 'max_iterations',
+  'chunk_align_window_s', 'max_iterations', 'joint_threshold',
+  'gripper_closed_value', 'gripper_open_value', 'gripper_threshold',
+  'timeout_sec',
 ]);
+
+const SG2_TARGET_JOINTS = {
+  left_target_joints: [
+    'arm_l_joint1',
+    'arm_l_joint2',
+    'arm_l_joint3',
+    'arm_l_joint4',
+    'arm_l_joint5',
+    'arm_l_joint6',
+    'arm_l_joint7',
+    'gripper_l_joint1',
+  ],
+  right_target_joints: [
+    'arm_r_joint1',
+    'arm_r_joint2',
+    'arm_r_joint3',
+    'arm_r_joint4',
+    'arm_r_joint5',
+    'arm_r_joint6',
+    'arm_r_joint7',
+    'gripper_r_joint1',
+  ],
+};
+
+const TARGET_POSITION_PARAM = {
+  left_target_joints: 'left_target_positions',
+  right_target_joints: 'right_target_positions',
+};
+
+const csvParts = (value) =>
+  String(value || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+function isSg2LikeRobot(robotType) {
+  const normalized = String(robotType || '').toLowerCase();
+  return !normalized || normalized.includes('sg2') || normalized.includes('bg2');
+}
+
+function getTargetJointOptions(robotType, key) {
+  if (!isSg2LikeRobot(robotType)) return [];
+  return SG2_TARGET_JOINTS[key] || [];
+}
 
 // Per-param helper text shown beneath the input. Keep these short — they
 // render directly under the field as a small gray hint.
@@ -32,9 +78,14 @@ const HELP_TEXT = {
   max_iterations: '0 = loop forever',
 };
 
-// JointControl toggles each sub-group on/off via these flags. Other
-// boolean params can be added here as they come up.
-const BOOL_PARAMS = new Set(['enable_head', 'enable_arms', 'enable_lift']);
+// Boolean params render as checkboxes.
+const BOOL_PARAMS = new Set([
+  'enable_head',
+  'enable_arms',
+  'enable_lift',
+  'detect_left_gripper',
+  'detect_right_gripper',
+]);
 
 // Enum params surface as <select> dropdowns. Keep value lists in sync with
 // the Python action definitions (send_command.COMMAND_MAP).
@@ -94,15 +145,28 @@ function isJointControlFieldDisabled(nodeType, key, params) {
   return false;  // enable_*, duration stay editable
 }
 
+function isArmStateGateFieldDisabled(nodeType, key, params) {
+  if (nodeType !== 'ArmStateGate') return false;
+  if (key === 'left_gripper_joint') {
+    return !truthy(params.detect_left_gripper);
+  }
+  if (key === 'right_gripper_joint') {
+    return !truthy(params.detect_right_gripper);
+  }
+  return false;
+}
+
 function isFieldDisabled(nodeType, key, params) {
   return (
     isSendCommandFieldDisabled(nodeType, key, params) ||
-    isJointControlFieldDisabled(nodeType, key, params)
+    isJointControlFieldDisabled(nodeType, key, params) ||
+    isArmStateGateFieldDisabled(nodeType, key, params)
   );
 }
 
 export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onNameChange }) {
   const dispatch = useDispatch();
+  const robotType = useSelector((state) => state.tasks?.robotType || '');
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId);
 
@@ -168,10 +232,101 @@ export default function BTParamPanel({ nodes, selectedNodeId, onParamChange, onN
     setShowPolicyBrowser(false);
   };
 
+  const commitTargetJointSelection = (paramName, nextJoints) => {
+    const positionsParam = TARGET_POSITION_PARAM[paramName];
+    const currentJoints = csvParts(localParams[paramName]);
+    const currentPositions = csvParts(localParams[positionsParam]);
+    const positionByJoint = new Map(
+      currentJoints.map((joint, idx) => [
+        joint,
+        currentPositions[idx] || '0.0',
+      ])
+    );
+    const nextPositions = nextJoints.map(
+      (joint) => positionByJoint.get(joint) || '0.0'
+    );
+    const jointsValue = nextJoints.join(', ');
+    const positionsValue = nextPositions.join(', ');
+
+    setLocalParams((prev) => ({
+      ...prev,
+      [paramName]: jointsValue,
+      [positionsParam]: positionsValue,
+    }));
+    onParamChange(selectedNodeId, paramName, jointsValue);
+    onParamChange(selectedNodeId, positionsParam, positionsValue);
+  };
+
+  const renderTargetJointSelector = (key, value, disabled = false) => {
+    const options = getTargetJointOptions(robotType, key);
+    const selected = csvParts(value);
+    const selectedSet = new Set(selected);
+    const disabledCls = disabled
+      ? ' bg-gray-100 text-gray-400 cursor-not-allowed'
+      : '';
+
+    if (options.length === 0) {
+      return (
+        <textarea
+          value={value}
+          disabled={disabled}
+          onChange={(e) => handleChange(key, e.target.value)}
+          onBlur={() => handleBlur(key)}
+          rows={String(value).length > 60 ? 3 : 1}
+          className={`w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y${disabledCls}`}
+        />
+      );
+    }
+
+    return (
+      <div className="space-y-2">
+        <div className="flex flex-wrap gap-1.5">
+          {options.map((jointName) => {
+            const isSelected = selectedSet.has(jointName);
+            return (
+              <button
+                key={jointName}
+                type="button"
+                disabled={disabled}
+                onClick={() => {
+                  const nextJoints = isSelected
+                    ? selected.filter((joint) => joint !== jointName)
+                    : options.filter((joint) => (
+                        joint === jointName || selectedSet.has(joint)
+                      ));
+                  commitTargetJointSelection(key, nextJoints);
+                }}
+                className={`px-2 py-1 border rounded text-xs transition-colors ${
+                  isSelected
+                    ? 'border-blue-500 bg-blue-50 text-blue-700'
+                    : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+                } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                {jointName}
+              </button>
+            );
+          })}
+        </div>
+        <textarea
+          value={value}
+          disabled={disabled}
+          onChange={(e) => handleChange(key, e.target.value)}
+          onBlur={() => handleBlur(key)}
+          rows={String(value).length > 60 ? 3 : 1}
+          className={`w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y${disabledCls}`}
+        />
+      </div>
+    );
+  };
+
   const renderInput = (key, value, disabled = false) => {
     const disabledCls = disabled
       ? ' bg-gray-100 text-gray-400 cursor-not-allowed'
       : '';
+
+    if (nodeType === 'ArmStateGate' && TARGET_POSITION_PARAM[key]) {
+      return renderTargetJointSelector(key, value, disabled);
+    }
 
     if (ENUM_PARAMS[key]) {
       return (

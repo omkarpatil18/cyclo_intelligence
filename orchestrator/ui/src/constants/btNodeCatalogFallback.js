@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Author: Seongwoo Kim
 
 export const FALLBACK_SCHEMA_VERSION = '1.0';
 
@@ -54,6 +56,33 @@ export const FALLBACK_CATALOG = [
       { name: 'enable_lift', type: 'bool', default: 'false' },
       { name: 'lift_position', type: 'number', default: '0.0' },
       { name: 'duration', type: 'number', default: '2.0' },
+    ],
+  },
+  {
+    tag: 'ArmStateGate',
+    category: 'action',
+    ports: [
+      { name: 'left_target_joints', type: 'string', default: '' },
+      { name: 'left_target_positions', type: 'string', default: '' },
+      { name: 'right_target_joints', type: 'string', default: '' },
+      { name: 'right_target_positions', type: 'string', default: '' },
+      { name: 'joint_threshold', type: 'number', default: '0.01' },
+      { name: 'detect_left_gripper', type: 'bool', default: 'false' },
+      { name: 'detect_right_gripper', type: 'bool', default: 'false' },
+      {
+        name: 'left_gripper_joint',
+        type: 'string',
+        default: 'gripper_l_joint1',
+      },
+      {
+        name: 'right_gripper_joint',
+        type: 'string',
+        default: 'gripper_r_joint1',
+      },
+      { name: 'gripper_closed_value', type: 'number', default: '1.0' },
+      { name: 'gripper_open_value', type: 'number', default: '0.0' },
+      { name: 'gripper_threshold', type: 'number', default: '0.05' },
+      { name: 'timeout_sec', type: 'number', default: '0.0' },
     ],
   },
   {

@@ -27,6 +27,7 @@ __all__ = [
     'SendCommand',
     'SendCommandAction',
     'Wait',
+    'ArmStateGate',
 ]
 
 
@@ -44,4 +45,9 @@ def __getattr__(name):
     if name == 'Wait':
         from orchestrator.bt.actions.wait import Wait
         return Wait
+    if name == 'ArmStateGate':
+        from orchestrator.bt.actions.arm_state_gate import (
+            ArmStateGate,
+        )
+        return ArmStateGate
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
