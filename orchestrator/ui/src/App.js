@@ -34,6 +34,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { moveToPage, persistCurrentPage } from './features/ui/uiSlice';
 import { persistRobotType } from './features/tasks/taskSlice';
 import PageType from './constants/pageType';
+import { BT_UNSUPPORTED_ROBOT_MESSAGE, isBtRobotSupported } from './constants/btSupport';
 
 function App() {
   const dispatch = useDispatch();
@@ -245,6 +246,13 @@ function App() {
   };
 
   const handleBTManagerPageNavigation = () => {
+    if (!isBtRobotSupported(robotType)) {
+      toast.error(BT_UNSUPPORTED_ROBOT_MESSAGE, {
+        duration: 4000,
+      });
+      return;
+    }
+
     isFirstLoad.current = false;
     dispatch(moveToPage(PageType.BT_MANAGER));
   };

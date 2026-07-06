@@ -31,6 +31,7 @@ const initialState = {
   imageTopicList: [],
   /** Persisted camera topic assignment [left, center, right] so it survives ImageGrid remounts */
   assignedImageTopics: [],
+  assignedImageTopicsRobotType: '',
   connectionError: null,
 };
 
@@ -55,7 +56,13 @@ const rosSlice = createSlice({
       state.imageTopicList = action.payload;
     },
     setAssignedImageTopics: (state, action) => {
-      state.assignedImageTopics = action.payload;
+      if (Array.isArray(action.payload)) {
+        state.assignedImageTopics = action.payload;
+        state.assignedImageTopicsRobotType = '';
+        return;
+      }
+      state.assignedImageTopics = action.payload?.topics || [];
+      state.assignedImageTopicsRobotType = action.payload?.robotType || '';
     },
     setConnectionError: (state, action) => {
       state.connectionError = action.payload;

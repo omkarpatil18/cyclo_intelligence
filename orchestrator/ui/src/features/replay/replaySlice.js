@@ -63,6 +63,8 @@ const initialState = {
 
   // Extended metadata
   robotType: '',
+  urdfPath: '',
+  endEffectorLinks: [],
   recordingDate: null,
   fileSizeBytes: 0,
   taskMarkers: [],
@@ -121,6 +123,8 @@ const replaySlice = createSlice({
       state.duration = data.duration || 0;
       // Extended metadata
       state.robotType = data.robot_type || '';
+      state.urdfPath = data.urdf_path || '';
+      state.endEffectorLinks = data.end_effector_links || [];
       state.recordingDate = data.recording_date || null;
       state.fileSizeBytes = data.file_size_bytes || 0;
       state.taskMarkers = data.task_markers || [];

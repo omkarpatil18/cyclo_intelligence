@@ -75,6 +75,14 @@ For LeRobot, user-trained models can be placed under
 | `REFILL_LATENCY_SAMPLE_MAX_S` | no | `2.0` | Ignore longer latency samples; `none` disables filtering |
 | `ZENOH_ROUTER_IP` / `ZENOH_ROUTER_PORT` / `ROS_DOMAIN_ID` | no | `127.0.0.1 / 7447 / 30` | both |
 
+`main-runtime` and `engine-process` source
+`/workspace/config/ros_zenoh.env` before applying these defaults. Update the
+host-side `docker/workspace/config/ros_zenoh.env` file when the robot's Zenoh
+router or ROS domain changes. `docker/container.sh start*` creates that file
+from the shared default `docker/config/ros_zenoh.default.env` if it is missing.
+Restarting the policy container is enough for the s6 processes to read the new
+values.
+
 For GR00T N1.7, the trained checkpoint may reference the gated
 `nvidia/Cosmos-Reason2-2B` backbone instead of vendoring those weights. Register
 a Hugging Face token for an approved account before first inference, or pre-cache

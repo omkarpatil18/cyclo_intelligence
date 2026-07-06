@@ -20,8 +20,27 @@ if [ -z "${SERVICE_NAME}" ]; then
     exit 1
 fi
 
-# Default ROS env (override via container environment).
+# Shared runtime ROS/Zenoh env. This intentionally runs after with-contenv so
+# /workspace/config/ros_zenoh.env can override compose/image defaults without a
+# rebuild when the robot network changes.
+export CYCLO_ROS_ENV_FILE=${CYCLO_ROS_ENV_FILE:-/workspace/config/ros_zenoh.env}
+if [ -f "${CYCLO_ROS_ENV_FILE}" ]; then
+    echo "[${SERVICE_NAME}] Loading ROS/Zenoh env from ${CYCLO_ROS_ENV_FILE}"
+    set -a
+    # shellcheck source=/dev/null
+    source "${CYCLO_ROS_ENV_FILE}"
+    set +a
+else
+    echo "[${SERVICE_NAME}] ROS/Zenoh env file not found: ${CYCLO_ROS_ENV_FILE}"
+    echo "[${SERVICE_NAME}] Using container environment and built-in defaults"
+fi
+
+# Default ROS env (override via shared/container environment).
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-30}
+export RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+export ZENOH_ROUTER_IP=${ZENOH_ROUTER_IP:-127.0.0.1}
+export ZENOH_ROUTER_PORT=${ZENOH_ROUTER_PORT:-7447}
+export ZENOH_CONFIG_OVERRIDE=${ZENOH_CONFIG_OVERRIDE:-transport/shared_memory/enabled=true}
 export ROS_DISTRO=${ROS_DISTRO:-jazzy}
 export COLCON_WS=${COLCON_WS:-/root/ros2_ws}
 export VENV_PATH=${VENV_PATH:-/opt/venv}
@@ -37,6 +56,9 @@ echo "[${SERVICE_NAME}] Starting service..."
 echo "[${SERVICE_NAME}] ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
 echo "[${SERVICE_NAME}] ROS_DISTRO=${ROS_DISTRO}"
 echo "[${SERVICE_NAME}] RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}"
+echo "[${SERVICE_NAME}] ZENOH_ROUTER_IP=${ZENOH_ROUTER_IP}"
+echo "[${SERVICE_NAME}] ZENOH_ROUTER_PORT=${ZENOH_ROUTER_PORT}"
+echo "[${SERVICE_NAME}] ZENOH_CONFIG_OVERRIDE=${ZENOH_CONFIG_OVERRIDE}"
 echo "[${SERVICE_NAME}] COLCON_WS=${COLCON_WS}"
 echo "[${SERVICE_NAME}] PID: $$"
 

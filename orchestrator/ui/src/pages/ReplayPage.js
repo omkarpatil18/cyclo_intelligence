@@ -92,6 +92,8 @@ function ReplayPage({ isActive }) {
     isVideoLoaded,
     // Extended metadata
     robotType,
+    urdfPath,
+    endEffectorLinks,
     recordingDate,
     fileSizeBytes,
     segments: replaySegments,
@@ -1339,6 +1341,8 @@ function ReplayPage({ isActive }) {
                   actionTimestamps={actionTimestamps}
                   actionNames={actionNames}
                   actionValues={actionValues}
+                  urdfPath={urdfPath}
+                  endEffectorLinks={endEffectorLinks}
                   currentTime={currentTime}
                   isPlaying={isPlaying}
                   playbackSpeed={playbackSpeed}

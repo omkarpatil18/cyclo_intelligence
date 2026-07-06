@@ -43,7 +43,7 @@ services:
   # ============================================================
   cyclo_intelligence:
     container_name: cyclo_intelligence
-    image: robotis/cyclo-intelligence:${VERSION:-1.0.0}-${ARCH:-arm64}
+    image: robotis/cyclo-intelligence:${VERSION:-1.1.1}-${ARCH:-arm64}
     build:
       context: ..
       dockerfile: docker/Dockerfile.${ARCH:-arm64}
@@ -72,6 +72,10 @@ services:
       - QT_X11_NO_MITSHM=1
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-30}
       - RMW_IMPLEMENTATION=rmw_zenoh_cpp
+      # Runtime scripts source this file after container env. Edit the
+      # host copy at docker/workspace/config/ros_zenoh.env when the
+      # Zenoh router IP/domain changes.
+      - CYCLO_ROS_ENV_FILE=/workspace/config/ros_zenoh.env
       # Cyclo does not start rmw_zenohd. This points at the external router.
       - ZENOH_ROUTER_IP=127.0.0.1
       - ZENOH_ROUTER_PORT=7447
@@ -87,6 +91,8 @@ services:
       - /dev:/dev
       - /dev/shm:/dev/shm
       - ./workspace:/workspace
+      # Keep s6 ROS/Zenoh env sourcing in sync even when using pre-built images.
+      - ./s6-services/common/ros2_service_run.sh:/usr/local/lib/s6-services/ros2_service_run.sh:ro
       - ./huggingface:/root/.cache/huggingface
       # Model dropboxes live under /workspace/model/{lerobot,groot}.
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
@@ -103,6 +109,7 @@ services:
       # bind-mounted at request time (not baked).
       - ../shared/shared/robot_configs/urdf:/usr/share/nginx/html/urdf/urdf:ro
       - ../shared/shared/robot_configs/ffw_description:/usr/share/nginx/html/urdf/ffw_description:ro
+      - ../shared/shared/robot_configs/open_manipulator_description:/usr/share/nginx/html/urdf/open_manipulator_description:ro
       # supervisor_api manages lerobot / groot lifecycle via Docker SDK
       # (PLAN §4.8). Socket mount makes that possible without DinD.
       - /var/run/docker.sock:/var/run/docker.sock
@@ -144,7 +151,7 @@ services:
   # ============================================================
   lerobot:
     container_name: lerobot_server
-    image: robotis/lerobot-zenoh:1.3.0-${ARCH:-arm64}
+    image: robotis/lerobot-zenoh:1.3.1-${ARCH:-arm64}
     build:
       # Build context bumped one level up so the Dockerfile can
       # COPY common/s6-services/ (shared across all policy backends)
@@ -175,6 +182,10 @@ services:
     # InferenceCommand.LOAD, then configures its local RobotClient command path.
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-30}
+      # Runtime scripts source this file after container env. Edit the
+      # host copy at docker/workspace/config/ros_zenoh.env when the
+      # Zenoh router IP/domain changes.
+      - CYCLO_ROS_ENV_FILE=/workspace/config/ros_zenoh.env
       - ZENOH_ROUTER_IP=127.0.0.1
       - ZENOH_ROUTER_PORT=7447
       - ZENOH_SDK_PATH=/zenoh_sdk
@@ -264,7 +275,7 @@ services:
   # ============================================================
   groot:
     container_name: groot_server
-    image: robotis/groot-zenoh:1.3.2-${ARCH:-arm64}
+    image: robotis/groot-zenoh:1.3.3-${ARCH:-arm64}
     build:
       context: ../cyclo_brain/policy/groot
       dockerfile: Dockerfile.${ARCH:-arm64}
@@ -292,6 +303,10 @@ services:
 
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-30}
+      # Runtime scripts source this file after container env. Edit the
+      # host copy at docker/workspace/config/ros_zenoh.env when the
+      # Zenoh router IP/domain changes.
+      - CYCLO_ROS_ENV_FILE=/workspace/config/ros_zenoh.env
       - ZENOH_ROUTER_IP=127.0.0.1
       - ZENOH_ROUTER_PORT=7447
       - ZENOH_SDK_PATH=/zenoh_sdk

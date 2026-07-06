@@ -2,6 +2,17 @@
 Changelog for package cyclo_brain
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.1.1 (2026-07-03)
+------------------
+* Updated Cyclo release metadata to 1.1.1.
+* Contributors: Taehyeong Kim
+
+1.1.0 (2026-07-01)
+------------------
+* Added shared ROS/Zenoh runtime environment sourcing for policy containers.
+* Updated policy image support to ``robotis/lerobot-zenoh:1.3.1`` and ``robotis/groot-zenoh:1.3.3``.
+* Contributors: Taehyeong Kim
+
 1.0.0 (2026-06-29)
 ------------------
 * Updated Cyclo release metadata to 1.0.0.

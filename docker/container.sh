@@ -71,6 +71,26 @@ ensure_host_dir() {
     [ -d "$1" ] || mkdir -p "$1"
 }
 
+ensure_ros_zenoh_env() {
+    local workspace_dir="$1"
+    local config_dir="${workspace_dir}/config"
+    local env_file="${config_dir}/ros_zenoh.env"
+    local template="${SCRIPT_DIR}/config/ros_zenoh.default.env"
+
+    ensure_host_dir "$config_dir"
+    if [ -f "$env_file" ]; then
+        return 0
+    fi
+    if [ ! -f "$template" ]; then
+        echo "[container.sh] Warning: ROS/Zenoh default env missing: $template" >&2
+        return 0
+    fi
+
+    cp "$template" "$env_file"
+    echo "[container.sh] Created ROS/Zenoh runtime env from default: $env_file"
+    echo "[container.sh] Edit this file when ROS_DOMAIN_ID or Zenoh router changes."
+}
+
 storage_root_usable() {
     local root="$1"
     local probe="${root}/.cyclo-write-test.$$"
@@ -358,6 +378,7 @@ setup_storage() {
     ensure_host_dir "${workspace_dir}/model"
     ensure_host_dir "${workspace_dir}/model/lerobot"
     ensure_host_dir "${workspace_dir}/model/groot"
+    ensure_ros_zenoh_env "$workspace_dir"
     ensure_host_dir "$huggingface_dir"
 
     workspace_real="$(canonical_path "$workspace_dir")"
@@ -498,8 +519,13 @@ Environment:
   FLASH_ATTN_CUDA_ARCHS
                    CUDA archs for GR00T Blackwell flash-attn builds
                    (default 120)
-  VERSION          image tag version (default: 1.0.0 for cyclo)
+  VERSION          image tag version (default: 1.1.1 for cyclo)
   ROS_DOMAIN_ID    default 30
+  docker/config/ros_zenoh.default.env
+                   Shared default copied into the workspace on first start.
+  docker/workspace/config/ros_zenoh.env
+                   Runtime ROS/Zenoh env shared by s6 services and shells.
+                   Edit this file when the Zenoh router IP/domain changes.
   CYCLO_STORAGE_MODE
                    auto | ssd | local (default auto). Containers always
                    mount docker/workspace and docker/huggingface. Auto uses
@@ -522,6 +548,31 @@ main_ui_dir() {
 main_container_has_npm() {
     container_running "$MAIN_CONTAINER" \
         && docker exec "$MAIN_CONTAINER" sh -lc 'command -v npm >/dev/null 2>&1'
+}
+
+enter_bash_with_runtime_env() {
+    local container="$1"
+    docker exec -it "$container" bash -lc '
+        set -e
+        rc=/tmp/cyclo_enter_bashrc
+        if [ -f /root/.bashrc ]; then
+            cp /root/.bashrc "$rc"
+        else
+            : > "$rc"
+        fi
+        if ! grep -q "CYCLO_ROS_ENV_FILE" "$rc"; then
+            {
+                printf "\n"
+                printf "%s\n" "# Cyclo ROS/Zenoh runtime environment."
+                printf "%s\n" "# Edit /workspace/config/ros_zenoh.env instead of setting these values here."
+                printf "%s\n" "export CYCLO_ROS_ENV_FILE=\${CYCLO_ROS_ENV_FILE:-/workspace/config/ros_zenoh.env}"
+                printf "%s\n" "if [ -f \"\${CYCLO_ROS_ENV_FILE}\" ]; then"
+                printf "%s\n" "    source \"\${CYCLO_ROS_ENV_FILE}\""
+                printf "%s\n" "fi"
+            } >> "$rc"
+        fi
+        exec bash --rcfile "$rc" -i
+    '
 }
 
 run_ui_npm_in_main() {
@@ -655,8 +706,9 @@ enter_main() {
         echo "Error: $MAIN_CONTAINER is not running. Run 'start' first." >&2
         exit 1
     fi
+    ensure_ros_zenoh_env "${SCRIPT_DIR}/workspace"
     setup_x11
-    docker exec -it "$MAIN_CONTAINER" bash
+    enter_bash_with_runtime_env "$MAIN_CONTAINER"
 }
 
 enter_lerobot() {
@@ -664,7 +716,8 @@ enter_lerobot() {
         echo "Error: $LEROBOT_CONTAINER is not running. Run 'start-lerobot' first." >&2
         exit 1
     fi
-    docker exec -it "$LEROBOT_CONTAINER" bash
+    ensure_ros_zenoh_env "${SCRIPT_DIR}/workspace"
+    enter_bash_with_runtime_env "$LEROBOT_CONTAINER"
 }
 
 enter_groot() {
@@ -672,7 +725,8 @@ enter_groot() {
         echo "Error: $GROOT_CONTAINER is not running. Run 'start-groot' first." >&2
         exit 1
     fi
-    docker exec -it "$GROOT_CONTAINER" bash
+    ensure_ros_zenoh_env "${SCRIPT_DIR}/workspace"
+    enter_bash_with_runtime_env "$GROOT_CONTAINER"
 }
 
 show_logs() {

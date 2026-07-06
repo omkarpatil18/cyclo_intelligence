@@ -123,6 +123,13 @@ LeRobot Training/Inference APIs
 | ROS_DOMAIN_ID | 30 | ROS2 domain |
 | ZENOH_CONFIG_OVERRIDE | (see compose) | Zenoh client configuration |
 
+At runtime, `lerobot_server` sources `/workspace/config/ros_zenoh.env` before
+starting `main-runtime` and `engine-process`. Edit the host-side
+`docker/workspace/config/ros_zenoh.env` file for robot-specific Zenoh router
+settings instead of baking router IPs into the image or `.bashrc`.
+`docker/container.sh start-lerobot` creates the workspace file from the shared
+default `docker/config/ros_zenoh.default.env` when it is missing.
+
 ## Testing
 
 ### Unit Tests
