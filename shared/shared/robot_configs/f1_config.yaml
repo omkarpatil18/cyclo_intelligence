@@ -1,8 +1,8 @@
 orchestrator:
   ros__parameters:
-    f2:
-      robot_name: "FFW F2"
-      urdf_path: urdf/ffw_f2_follower.urdf
+    f1:
+      robot_name: "FFW F1"
+      urdf_path: urdf/ffw_f1_follower.urdf
 
       # ────────────────────────────────────────────────────────────────
       # Observation — every signal the policy reads from the robot.
@@ -51,13 +51,6 @@ orchestrator:
               - head_joint1
               - head_joint2
               - lift_joint
-          mobile:
-            topic: /odom
-            msg_type: nav_msgs/msg/Odometry
-            joint_names:
-              - linear_x
-              - linear_y
-              - angular_z
 
       # ────────────────────────────────────────────────────────────────
       # Action — every modality the policy commands. Each entry's topic
@@ -101,13 +94,6 @@ orchestrator:
           msg_type: trajectory_msgs/msg/JointTrajectory
           joint_names:
             - lift_joint
-        mobile:
-          topic: /cmd_vel
-          msg_type: geometry_msgs/msg/Twist
-          joint_names:
-            - linear_x
-            - linear_y
-            - angular_z
 
       # ────────────────────────────────────────────────────────────────
       # Recording — auxiliary topics that need to be in the bag but are

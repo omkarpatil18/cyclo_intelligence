@@ -99,7 +99,7 @@ def test_f2_config_uses_realsense_head_camera_layout():
 
     assert robot_schema.get_image_topics(section) == {
         "cam_head": {
-            "topic": "/camera_head/camera_head/color/image_rect_raw/compressed",
+            "topic": "/camera_head/camera_head/color/image_raw/compressed",
             "msg_type": "sensor_msgs/msg/CompressedImage",
         },
         "cam_left_wrist": {
@@ -141,6 +141,29 @@ def test_f2_urdf_path_and_mesh_assets_resolve():
     _assert_urdf_path_and_mesh_assets_resolve(
         "f2",
         "ffw_f2_follower.urdf",
+    )
+
+
+def test_f1_state_and_action_dimensions_match_layout():
+    section = robot_schema.load_robot_section("f1")
+
+    state_dim = sum(
+        len(cfg["joint_names"])
+        for cfg in robot_schema.get_state_groups(section).values()
+    )
+    action_dim = sum(
+        len(cfg["joint_names"])
+        for cfg in robot_schema.get_action_groups(section).values()
+    )
+
+    assert state_dim == 19
+    assert action_dim == 19
+
+
+def test_f1_urdf_path_and_mesh_assets_resolve():
+    _assert_urdf_path_and_mesh_assets_resolve(
+        "f1",
+        "ffw_f1_follower.urdf",
     )
 
 
