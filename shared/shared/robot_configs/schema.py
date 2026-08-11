@@ -264,6 +264,19 @@ def get_recording_extra_topics(section: Dict[str, Any]) -> List[str]:
     return [t for t in extras if t]
 
 
+def get_inference_recording_extra_topics(section: Dict[str, Any]) -> List[str]:
+    """Return MCAP-only topics needed to audit policy inference episodes.
+
+    These topics are intentionally separate from ``extra_topics`` so ordinary
+    teleoperation recordings keep their established topic contract.  They are
+    added only when the caller explicitly requests an inference inventory.
+    """
+    extras = (
+        (section.get("recording") or {}).get("inference_extra_topics") or []
+    )
+    return [t for t in extras if t]
+
+
 def get_camera_info_topics(section: Dict[str, Any]) -> Dict[str, str]:
     """Pair each camera with its camera_info topic from ``recording.extra_topics``.
 
@@ -300,7 +313,9 @@ def get_camera_info_topics(section: Dict[str, Any]) -> Dict[str, str]:
     return info_topics
 
 
-def get_mcap_record_topics(section: Dict[str, Any]) -> List[str]:
+def get_mcap_record_topics(
+    section: Dict[str, Any], *, inference: bool = False
+) -> List[str]:
     """Topics to record into the per-episode MCAP (no images, no camera_info).
 
     Recording format version 2 routes images to per-camera MP4 files and
@@ -321,7 +336,12 @@ def get_mcap_record_topics(section: Dict[str, Any]) -> List[str]:
         if extra in info_topics:
             continue
         topics.append(extra)
-    return topics
+    if inference:
+        topics.extend(get_inference_recording_extra_topics(section))
+
+    # Preserve schema order while avoiding duplicate rosbag subscriptions if
+    # an integration topic is also present in the common inventory.
+    return list(dict.fromkeys(topics))
 
 
 def get_recording_topics(section: Dict[str, Any]) -> List[str]:

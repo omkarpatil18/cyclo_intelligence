@@ -40,6 +40,13 @@ if _SDK_PATH and _SDK_PATH not in sys.path:
 
 from zenoh_ros2_sdk import ROS2Publisher, ROS2Subscriber, get_message_class  # noqa: E402
 
+from .messages import (  # noqa: E402
+    ACTION_CHUNK_DEF,
+    ACTION_CHUNK_TOPIC,
+    ACTION_STEP_ACK_DEF,
+    ACTION_STEP_ACK_TOPIC,
+)
+
 
 # -- robot config schema helper -----------------------------------------------
 # shared/robot_configs/ is bind-mounted into the policy container at
@@ -178,6 +185,7 @@ class RobotClient:
         domain_id: Optional[int] = None,
         enable_command_publishers: bool = False,
         enable_preview_publisher: bool = False,
+        enable_chunk_transport: bool = False,
     ):
         section = robot_schema.load_robot_section(robot_type)
         # Phase 4: yaml is VLA-semantic (observation.images / state +
@@ -194,6 +202,7 @@ class RobotClient:
         self._domain_id = domain_id
         self._enable_command_publishers = bool(enable_command_publishers)
         self._enable_preview_publisher = bool(enable_preview_publisher)
+        self._enable_chunk_transport = bool(enable_chunk_transport)
         self._action_groups = robot_schema.get_action_groups(section)
 
         # Thread-safe data stores
@@ -211,6 +220,8 @@ class RobotClient:
         self._subscribers: list = []
         self._command_publishers: dict[str, ROS2Publisher] = {}
         self._preview_publisher: Optional[ROS2Publisher] = None
+        self._action_chunk_publisher: Optional[ROS2Publisher] = None
+        self._latest_action_step_ack: Optional[dict] = None
         self._command_msg_types: dict[str, str] = {}
         self._command_joint_names: dict[str, list[str]] = {}
         self._action_keys = sorted(self._action_groups.keys())
@@ -235,6 +246,8 @@ class RobotClient:
                 )
         if self._enable_preview_publisher:
             self._init_preview_publisher()
+        if self._enable_chunk_transport:
+            self._init_chunk_transport()
         logger.info(f"RobotClient initialized: {robot_type} "
                      f"({len(self._config.get('cameras', {}))} cameras, "
                      f"{len(self._config.get('joint_groups', {}))} joint groups)")
@@ -342,6 +355,34 @@ class RobotClient:
         )
         logger.debug("Action preview publisher: /inference/trajectory_preview")
 
+    def _init_chunk_transport(self) -> None:
+        """Create the atomic action-chunk publisher and step-ACK subscriber."""
+        common = {
+            "router_ip": self._router_ip,
+            "router_port": self._router_port,
+        }
+        if self._domain_id is not None:
+            common["domain_id"] = self._domain_id
+        self._action_chunk_publisher = ROS2Publisher(
+            topic=ACTION_CHUNK_TOPIC,
+            msg_type="interfaces/msg/ActionChunk",
+            msg_definition=ACTION_CHUNK_DEF,
+            **common,
+        )
+        ack_subscriber = ROS2Subscriber(
+            topic=ACTION_STEP_ACK_TOPIC,
+            msg_type="interfaces/msg/ActionStepAck",
+            msg_definition=ACTION_STEP_ACK_DEF,
+            callback=self._update_action_step_ack,
+            **common,
+        )
+        self._subscribers.append(ack_subscriber)
+        logger.info(
+            "Action chunk transport enabled: %s -> %s",
+            ACTION_CHUNK_TOPIC,
+            ACTION_STEP_ACK_TOPIC,
+        )
+
     # ------------------------------------------------------------------ #
     # Callback handlers
     # ------------------------------------------------------------------ #
@@ -448,6 +489,28 @@ class RobotClient:
                 self._sensor_timestamps[sensor_name] = time.time()
         except Exception as e:
             logger.warning(f"Failed to parse sensor {sensor_name}: {e}")
+
+    def _update_action_step_ack(self, msg) -> None:
+        """Store the newest external environment step acknowledgement."""
+        try:
+            ack = {
+                "session_id": int(msg.session_id),
+                "seq_id": int(msg.seq_id),
+                "action_index": int(msg.action_index),
+                "executed_steps": int(msg.executed_steps),
+                "chunk_size": int(msg.chunk_size),
+                "status": int(msg.status),
+                "executed_action": np.asarray(
+                    msg.executed_action,
+                    dtype=np.float64,
+                ).reshape(-1),
+                "timestamp": float(msg.timestamp),
+            }
+        except Exception as e:
+            logger.warning("Failed to decode action step ACK: %s", e)
+            return
+        with self._lock:
+            self._latest_action_step_ack = ack
 
     # ------------------------------------------------------------------ #
     # Image API
@@ -577,6 +640,54 @@ class RobotClient:
     @property
     def action_keys(self) -> list[str]:
         return list(self._action_keys)
+
+    def publish_action_chunk(
+        self,
+        chunk: np.ndarray,
+        session_id: int,
+        seq_id: int,
+    ) -> None:
+        """Publish one complete row-major action chunk atomically."""
+        if self._action_chunk_publisher is None:
+            raise RuntimeError("RobotClient action chunk transport is not enabled")
+        values = np.asarray(chunk, dtype=np.float64)
+        if values.ndim != 2 or values.shape[0] <= 0 or values.shape[1] <= 0:
+            raise ValueError(f"action chunk must be a non-empty 2D array, got {values.shape}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("action chunk contains non-finite values")
+        self._action_chunk_publisher.publish(
+            session_id=int(session_id),
+            seq_id=int(seq_id),
+            chunk_size=int(values.shape[0]),
+            action_dim=int(values.shape[1]),
+            # rosbags' CDR serializer expects primitive ROS sequences as
+            # numpy arrays (it calls ``view`` on the field value).  Keeping
+            # this contiguous also makes the row-major wire contract explicit.
+            data=np.ascontiguousarray(values.reshape(-1), dtype=np.float64),
+        )
+
+    def cancel_action_chunk(self, session_id: int, seq_id: int) -> None:
+        """Cancel a queued chunk using a zero-sized message for the same id."""
+        if self._action_chunk_publisher is None:
+            return
+        self._action_chunk_publisher.publish(
+            session_id=int(session_id),
+            seq_id=int(seq_id),
+            chunk_size=0,
+            action_dim=0,
+            data=np.empty(0, dtype=np.float64),
+        )
+
+    def get_latest_action_step_ack(self) -> Optional[dict]:
+        """Return a defensive copy of the newest environment step ACK."""
+        with self._lock:
+            if self._latest_action_step_ack is None:
+                return None
+            ack = dict(self._latest_action_step_ack)
+            ack["executed_action"] = self._latest_action_step_ack[
+                "executed_action"
+            ].copy()
+            return ack
 
     def publish_action(self, action: np.ndarray, action_keys: Optional[list[str]] = None) -> None:
         """Publish one flat action vector to the robot command topics.
@@ -889,6 +1000,12 @@ class RobotClient:
             except Exception as e:
                 logger.debug(f"Error closing preview publisher: {e}")
             self._preview_publisher = None
+        if self._action_chunk_publisher is not None:
+            try:
+                self._action_chunk_publisher.close()
+            except Exception as e:
+                logger.debug(f"Error closing action chunk publisher: {e}")
+            self._action_chunk_publisher = None
         logger.info("RobotClient closed")
 
     def __del__(self):

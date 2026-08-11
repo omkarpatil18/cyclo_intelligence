@@ -29,6 +29,13 @@ const FAILED_MESSAGE = 'Task info not synced; robot button may use old task.';
 export const ROBOT_TYPE_STORAGE_KEY = 'cyclo_intelligence.robot_type';
 export const ROBOT_TYPE_STATUS_GUARD_MS = 30000;
 
+export const InferenceRecordingUiPhase = Object.freeze({
+  IDLE: 'idle',
+  STARTING: 'starting',
+  ACTIVE: 'active',
+  STOPPING: 'stopping',
+});
+
 const getSessionStorage = () => {
   if (typeof window === 'undefined') {
     return null;
@@ -111,13 +118,13 @@ const inferenceTaskInfoInitialState = {
   taskType: 'inference',
   policyPath: '',
   recordInferenceMode: false,
-  controlHz: 100,
+  controlHz: 15,
   inferenceHz: 15,
   chunkAlignWindowS: 0.3,
   serviceType: 'lerobot',
   policyType: 'act',
   inferenceMode: 'simulation',
-  actionRequestMode: 'async',
+  actionRequestMode: 'sync',
   accelerationMode: 'pytorch',
   accelerationEnginePath: '',
 };
@@ -284,7 +291,7 @@ const applyInferenceTaskInfo = (state, taskInfo = {}) => {
     recordInferenceMode: Object.prototype.hasOwnProperty.call(taskInfo, 'recordInferenceMode')
       ? Boolean(taskInfo.recordInferenceMode)
       : Boolean(state.inferenceTaskInfo.recordInferenceMode),
-    controlHz: taskInfo.controlHz ?? state.inferenceTaskInfo.controlHz ?? 100,
+    controlHz: taskInfo.controlHz ?? state.inferenceTaskInfo.controlHz ?? 15,
     inferenceHz: taskInfo.inferenceHz ?? state.inferenceTaskInfo.inferenceHz ?? 15,
     chunkAlignWindowS:
       taskInfo.chunkAlignWindowS ?? state.inferenceTaskInfo.chunkAlignWindowS ?? 0.3,
@@ -296,9 +303,9 @@ const applyInferenceTaskInfo = (state, taskInfo = {}) => {
     actionRequestMode:
       String(
         taskInfo.actionRequestMode ?? state.inferenceTaskInfo.actionRequestMode ?? ''
-      ).trim().toLowerCase() === 'sync'
-        ? 'sync'
-        : 'async',
+      ).trim().toLowerCase() === 'async'
+        ? 'async'
+        : 'sync',
     accelerationMode: String(
       taskInfo.accelerationMode ?? state.inferenceTaskInfo.accelerationMode ?? 'pytorch'
     ),
@@ -327,6 +334,8 @@ const initialState = {
   // record-session state.
   recordStatus: {
     taskName: 'idle',
+    taskType: '',
+    recordInferenceMode: false,
     running: false,
     recordPhase: RecordPhase.READY,
     progress: 0,
@@ -351,6 +360,14 @@ const initialState = {
     recordingOperationStage: '',
     recordingOperationMessage: '',
     topicReceived: false,
+  },
+
+  // Browser-side command state bridges the short gap between a successful
+  // recording RPC and the next /data/recording/status sample. Keeping this
+  // shared lets the data-collection panel, Clear control, and deploy-target
+  // selector enforce one lifecycle lock consistently.
+  inferenceRecordingUi: {
+    phase: InferenceRecordingUiPhase.IDLE,
   },
 
   // Inference-side snapshot from /task/inference_status (orchestrator
@@ -416,10 +433,59 @@ const taskSlice = createSlice({
       syncLegacyTaskInfo(state);
     },
     setRecordStatus: (state, action) => {
-      state.recordStatus = { ...state.recordStatus, ...action.payload };
+      const previousStatus = state.recordStatus;
+      const nextStatus = { ...previousStatus, ...action.payload };
+      state.recordStatus = nextStatus;
+
+      const previousServerOwned =
+        previousStatus.taskType === 'inference' ||
+        Boolean(previousStatus.recordInferenceMode);
+      const previousServerBusy =
+        previousServerOwned &&
+        previousStatus.recordPhase !== RecordPhase.READY;
+      const nextServerOwned =
+        nextStatus.taskType === 'inference' ||
+        Boolean(nextStatus.recordInferenceMode);
+      const uiPhase = state.inferenceRecordingUi.phase;
+
+      if (
+        nextServerOwned &&
+        nextStatus.recordPhase === RecordPhase.RECORDING
+      ) {
+        // A repeated RECORDING sample must not undo an operator's pending
+        // Success/Fail save request.
+        if (uiPhase !== InferenceRecordingUiPhase.STOPPING) {
+          state.inferenceRecordingUi.phase =
+            InferenceRecordingUiPhase.ACTIVE;
+        }
+      } else if (
+        nextServerOwned &&
+        nextStatus.recordPhase === RecordPhase.SAVING
+      ) {
+        state.inferenceRecordingUi.phase =
+          InferenceRecordingUiPhase.STOPPING;
+      } else if (
+        nextStatus.recordPhase === RecordPhase.READY &&
+        (
+          uiPhase === InferenceRecordingUiPhase.STOPPING ||
+          previousServerBusy
+        )
+      ) {
+        state.inferenceRecordingUi.phase = InferenceRecordingUiPhase.IDLE;
+      }
     },
     resetRecordStatus: (state) => {
       state.recordStatus = initialState.recordStatus;
+      state.inferenceRecordingUi = { ...initialState.inferenceRecordingUi };
+    },
+    setInferenceRecordingUiPhase: (state, action) => {
+      const phase = String(action.payload || '');
+      if (Object.values(InferenceRecordingUiPhase).includes(phase)) {
+        state.inferenceRecordingUi.phase = phase;
+      }
+    },
+    resetInferenceRecordingUi: (state) => {
+      state.inferenceRecordingUi = { ...initialState.inferenceRecordingUi };
     },
     setInferenceStatus: (state, action) => {
       state.inferenceStatus = { ...state.inferenceStatus, ...action.payload };
@@ -768,6 +834,43 @@ export const selectInferenceTaskInfo = createSelector(
   (tasks) => buildInferenceTaskInfo(tasks)
 );
 
+export const selectInferenceRecordingControl = createSelector(
+  [selectTasksState],
+  (tasks) => {
+    const recordStatus = tasks.recordStatus || {};
+    const uiPhase = tasks.inferenceRecordingUi?.phase ||
+      InferenceRecordingUiPhase.IDLE;
+    const serverOwnsInferenceRecording =
+      recordStatus.taskType === 'inference' ||
+      Boolean(recordStatus.recordInferenceMode);
+    const serverRecording =
+      serverOwnsInferenceRecording &&
+      recordStatus.recordPhase === RecordPhase.RECORDING;
+    const serverSaving =
+      serverOwnsInferenceRecording &&
+      recordStatus.recordPhase === RecordPhase.SAVING;
+    const pending = [
+      InferenceRecordingUiPhase.STARTING,
+      InferenceRecordingUiPhase.STOPPING,
+    ].includes(uiPhase);
+    const active =
+      uiPhase === InferenceRecordingUiPhase.ACTIVE || serverRecording;
+    const serverBusy =
+      serverOwnsInferenceRecording &&
+      recordStatus.recordPhase !== RecordPhase.READY;
+
+    return {
+      uiPhase,
+      active,
+      pending,
+      serverRecording,
+      serverSaving,
+      lifecycleLocked:
+        uiPhase !== InferenceRecordingUiPhase.IDLE || serverBusy,
+    };
+  }
+);
+
 export const {
   setTaskInfo,
   setRecordTaskInfo,
@@ -776,6 +879,8 @@ export const {
   resetTaskInfo,
   setRecordStatus,
   resetRecordStatus,
+  setInferenceRecordingUiPhase,
+  resetInferenceRecordingUi,
   setInferenceStatus,
   resetInferenceStatus,
   selectRobotType,

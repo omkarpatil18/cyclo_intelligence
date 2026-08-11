@@ -276,3 +276,18 @@ def test_policy_compose_keeps_image_defaults_in_images():
         assert "ENV ZENOH_SDK_PATH=/zenoh_sdk" in contents
         assert "ENV ROBOT_CLIENT_SDK_PATH=/robot_client_sdk" in contents
         assert "ENV ACTION_CHUNK_PROCESSING_SDK_PATH=/action_chunk_processing_sdk" in contents
+
+
+def test_lerobot_compose_streams_native_act_rows_at_15_hz():
+    compose = (REPO_ROOT / "docker" / "docker-compose.yml").read_text()
+
+    expected_entries = (
+        "INFERENCE_HZ=${LEROBOT_INFERENCE_HZ:-15.0}",
+        "CONTROL_HZ=${LEROBOT_CONTROL_HZ:-15.0}",
+        "TARGET_CHUNK_SIZE=${LEROBOT_TARGET_CHUNK_SIZE:-30}",
+        "ACTION_REQUEST_MODE=${LEROBOT_ACTION_REQUEST_MODE:-sync}",
+        "POSTPROCESS_ACTIONS=${LEROBOT_POSTPROCESS_ACTIONS:-false}",
+        "ACTION_EXECUTION_MODE=${LEROBOT_ACTION_EXECUTION_MODE:-row}",
+    )
+    for entry in expected_entries:
+        assert entry in compose

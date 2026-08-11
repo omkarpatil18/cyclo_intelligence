@@ -95,3 +95,7 @@ Thumbs.db
 *.pth
 *.onnx
 *.engine
+
+# Generated evaluation media
+/eval_tools/results/**/*.png
+/eval_tools/results/**/*.mp4

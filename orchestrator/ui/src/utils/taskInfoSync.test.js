@@ -3,10 +3,22 @@ import PageType from '../constants/pageType';
 import {
   getInferenceTaskInfoKey,
   hasRosTaskInfoPayload,
+  rosTaskInfoToUiTaskInfo,
   shouldApplyServerTaskInfoToPage,
 } from './taskInfoSync';
 
 describe('taskInfoSync echo routing', () => {
+  test('round-trips the policy family needed by recording metadata', () => {
+    expect(rosTaskInfoToUiTaskInfo({ policy_type: 'smolvla' }).policyType).toBe(
+      'smolvla'
+    );
+    expect(rosTaskInfoToUiTaskInfo({}).policyType).toBe('act');
+    expect(rosTaskInfoToUiTaskInfo({
+      service_type: 'groot',
+      policy_type: '',
+    }).policyType).toBe('n17');
+  });
+
   test('detects inference task info even without record identity fields', () => {
     expect(hasRosTaskInfoPayload({
       task_type: 'inference',
@@ -88,7 +100,7 @@ describe('taskInfoSync echo routing', () => {
       taskInstruction: ['pick'],
       policyPath: '/policy',
       serviceType: 'groot',
-      controlHz: 100,
+      controlHz: 15,
       inferenceHz: 15,
       chunkAlignWindowS: 0.3,
     }));

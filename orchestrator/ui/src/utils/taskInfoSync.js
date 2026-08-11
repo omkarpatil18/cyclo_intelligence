@@ -13,7 +13,7 @@ const numberOrDefault = (value, fallback) => {
 };
 
 const actionRequestModeOrDefault = (value) => (
-  String(value ?? '').trim().toLowerCase() === 'sync' ? 'sync' : 'async'
+  String(value ?? '').trim().toLowerCase() === 'async' ? 'async' : 'sync'
 );
 
 export const normalizeRecordTaskInfo = (taskInfo = {}) => ({
@@ -38,7 +38,7 @@ export const normalizeInferenceTaskInfo = (taskInfo = {}) => ({
   taskInstruction: stringArray(taskInfo.taskInstruction),
   policyPath: String(taskInfo.policyPath ?? '').trim(),
   recordInferenceMode: Boolean(taskInfo.recordInferenceMode),
-  controlHz: numberOrDefault(taskInfo.controlHz ?? 100, 100),
+  controlHz: numberOrDefault(taskInfo.controlHz ?? 15, 15),
   inferenceHz: numberOrDefault(taskInfo.inferenceHz ?? 15, 15),
   chunkAlignWindowS: numberOrDefault(taskInfo.chunkAlignWindowS ?? 0.3, 0.3),
   serviceType: String(taskInfo.serviceType ?? '').trim(),
@@ -64,12 +64,15 @@ export const rosTaskInfoToUiTaskInfo = (taskInfo = {}) => ({
   policyPath: taskInfo.policy_path || '',
   recordInferenceMode: Boolean(taskInfo.record_inference_mode),
   serviceType: taskInfo.service_type || 'lerobot',
+  policyType: taskInfo.policy_type || (
+    taskInfo.service_type === 'groot' ? 'n17' : 'act'
+  ),
   inferenceMode: taskInfo.inference_mode || 'simulation',
   actionRequestMode: actionRequestModeOrDefault(taskInfo.action_request_mode),
   accelerationMode: taskInfo.acceleration_mode || 'pytorch',
   accelerationEnginePath: taskInfo.acceleration_engine_path || '',
   userId: taskInfo.user_id || '',
-  controlHz: taskInfo.control_hz || 100,
+  controlHz: taskInfo.control_hz || 15,
   inferenceHz: taskInfo.inference_hz || 15,
   chunkAlignWindowS: taskInfo.chunk_align_window_s || 0.3,
   includeRobotisLicense: Boolean(taskInfo.include_robotis_license),

@@ -122,6 +122,9 @@ jobs:
               src/shared \
             --event-handlers console_cohesion+
           colcon test-result --verbose
+          python3 -m pytest \
+            "${GITHUB_WORKSPACE}/repo/orchestrator/tests/test_cyclo_data_client_recording_outcome.py" \
+            "${GITHUB_WORKSPACE}/repo/orchestrator/tests/test_inference_recording_lifecycle.py"
 
   python-tests:
     name: Python tests
@@ -257,6 +260,19 @@ jobs:
       - name: Install dependencies
         working-directory: orchestrator/ui
         run: npm ci --legacy-peer-deps
+
+      - name: Test inference data collection UI contract
+        working-directory: orchestrator/ui
+        env:
+          CI: 'true'
+        run: >-
+          npm test -- --watchAll=false --runTestsByPath
+          src/hooks/useRosServiceCaller.test.js
+          src/components/InferenceRLDataCollectPanel.test.js
+          src/components/InferenceControlPanel.test.js
+          src/components/InferencePanel.test.js
+          src/features/tasks/taskSlice.test.js
+          src/utils/taskInfoSync.test.js
 
       - name: Build UI
         working-directory: orchestrator/ui

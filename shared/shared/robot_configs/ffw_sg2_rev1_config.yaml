@@ -28,9 +28,6 @@ orchestrator:
             topic: /camera_right/camera_right/color/image_rect_raw/compressed
             msg_type: sensor_msgs/msg/CompressedImage
             rotation_deg: 270
-          cam_right_head:
-            topic: /zed/zed_node/right/image_rect_color/compressed
-            msg_type: sensor_msgs/msg/CompressedImage
 
         state:
           # Each entry contributes one slice of observation.state. Order
@@ -125,6 +122,11 @@ orchestrator:
         extra_topics:
           - /tf
           - /zed/zed_node/left/camera_info
-          - /zed/zed_node/right/camera_info
           - /camera_left/camera_left/color/camera_info
           - /camera_right/camera_right/color/camera_info
+        # Policy transport evidence belongs only to RL/inference episodes.
+        # Keeping it out of extra_topics preserves the teleoperation dataset
+        # contract while making every executed chunk independently auditable.
+        inference_extra_topics:
+          - /inference/action_chunk
+          - /inference/action_step_ack

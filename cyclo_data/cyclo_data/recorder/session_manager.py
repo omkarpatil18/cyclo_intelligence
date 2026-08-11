@@ -18,9 +18,11 @@
 
 import json
 import errno
+import hashlib
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -168,21 +170,55 @@ class DataManager:
 
     # Progress queue for multiprocessing communication
     _progress_queue = None
+    _PROVENANCE_SCHEMA_VERSION = 1
+    _RL_CONTRACT_SCHEMA_VERSION = 1
+    _MAX_CONFIG_HASH_BYTES = 1024 * 1024
+    _ACT_CHUNK_SIZE = 30
+    _ACT_ACTION_DIM = 22
+    _ACT_TARGET_HZ = 15
+    _ACTION_CHUNK_TOPIC = '/inference/action_chunk'
+    _ACTION_STEP_ACK_TOPIC = '/inference/action_step_ack'
 
     def __init__(
             self,
             save_root_path,
             robot_type,
-            task_info):
+            task_info,
+            collection_id: str = ''):
         self._robot_type = robot_type
+        self._task_type = str(getattr(task_info, 'task_type', '') or '')
+        self._collection_id = (
+            self.validate_collection_id(collection_id)
+            if self._task_type == 'inference'
+            else ''
+        )
+        save_root_path = Path(save_root_path)
         self._save_repo_name = self._make_save_repo_name(
             save_root_path,
             task_info,
+            collection_id=self._collection_id,
         )
-        self._save_path = save_root_path / self._save_repo_name
-        self._save_rosbag_path = '/workspace/rosbag2/' + self._save_repo_name
+        dataset_root = (
+            save_root_path / 'inference'
+            if self._task_type == 'inference'
+            else save_root_path
+        )
+        self._save_path = self._validated_dataset_path(
+            dataset_root,
+            self._save_repo_name,
+        )
+        self._save_rosbag_path = str(self._save_path)
         self._task_info = task_info
-        self._main_task_instruction = self._get_main_task_instruction(task_info)
+        self._policy_provenance = None
+        self._rl_episode_contract = None
+        if self._task_type == 'inference':
+            self._policy_provenance = self._build_policy_provenance(task_info)
+            if str(getattr(task_info, 'policy_type', '') or '').lower() == 'act':
+                self._rl_episode_contract = self._build_act_rl_episode_contract()
+        (
+            self._main_task_instruction,
+            self._task_instruction_source,
+        ) = self._resolve_main_task_instruction(task_info)
         self._subtask_instructions = self._get_subtask_instructions(task_info)
         self._subtask_mode = bool(self._subtask_instructions)
         self._subtask_total = len(self._subtask_instructions)
@@ -193,7 +229,14 @@ class DataManager:
         self._episode_info_scan_cache = self._collect_episode_info_entries()
         try:
             self._validate_existing_segment_count()
-
+        finally:
+            self._episode_info_scan_cache = None
+        # Complete segments left behind by an archive failure or process crash
+        # are finalized before a new recording cursor is selected. Incomplete
+        # episodes remain untouched for explicit user recovery/discard.
+        self._recovered_episode_dirs = self._recover_complete_segment_archives()
+        self._episode_info_scan_cache = self._collect_episode_info_entries()
+        try:
             # Per-recording opt-in flag from the UI checkbox; getattr guards
             # against TaskInfo messages built before the field was added.
             self._include_robotis_license = bool(
@@ -231,28 +274,335 @@ class DataManager:
         # in ``get_current_record_status`` is consistent.
         self._state_lock = threading.Lock()
 
+    @staticmethod
+    def _checkpoint_id(policy_path: str) -> str:
+        """Return a stable, human-readable checkpoint identifier."""
+        path = Path(str(policy_path or '').rstrip('/'))
+        if not str(policy_path or '').strip():
+            return ''
+        parts = path.parts
+        for index, part in enumerate(parts[:-1]):
+            if part == 'checkpoints' and index + 1 < len(parts):
+                return parts[index + 1]
+        if path.name == 'pretrained_model' and path.parent.name:
+            return path.parent.name
+        return path.stem if path.suffix else path.name
+
+    @staticmethod
+    def _artifact_files(policy_path: str) -> list[tuple[str, Path, int]]:
+        """Return deterministic, symlink-free policy artifact entries."""
+        root = Path(str(policy_path or ''))
+        if not str(policy_path or '').strip() or not root.exists():
+            return []
+        if root.is_symlink():
+            return []
+        if root.is_file():
+            try:
+                return [(root.name, root, int(root.stat().st_size))]
+            except OSError:
+                return []
+
+        files: list[tuple[str, Path, int]] = []
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            directory = Path(dirpath)
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not (directory / name).is_symlink()
+            )
+            for filename in sorted(filenames):
+                path = directory / filename
+                if path.is_symlink():
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    size = int(path.stat().st_size)
+                    name = path.relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                files.append((name, path, size))
+        files.sort(key=lambda item: item[0])
+        return files
+
     @classmethod
-    def _make_save_repo_name(cls, save_root_path, task_info) -> str:
-        """Return the task folder name and normalise inference metadata."""
+    def _select_small_config(
+        cls,
+        artifacts: list[tuple[str, Path, int]],
+    ) -> tuple[str, str]:
+        """Hash one canonical small config, never checkpoint weights."""
+        preferred = (
+            'config.json',
+            'train_config.json',
+            'pretrained_model/config.json',
+            'modality.json',
+            'config.yaml',
+            'config.yml',
+        )
+        eligible = [
+            entry for entry in artifacts
+            if entry[2] <= cls._MAX_CONFIG_HASH_BYTES
+            and (
+                Path(entry[0]).name.lower() in {
+                    'config.json',
+                    'train_config.json',
+                    'modality.json',
+                    'config.yaml',
+                    'config.yml',
+                }
+                or 'config' in Path(entry[0]).stem.lower()
+            )
+        ]
+        by_name = {entry[0]: entry for entry in eligible}
+        selected = next(
+            (by_name[name] for name in preferred if name in by_name),
+            None,
+        )
+        if selected is None and eligible:
+            selected = min(
+                eligible,
+                key=lambda entry: (entry[0].count('/'), entry[0]),
+            )
+        if selected is None:
+            return '', ''
+        name, path, _size = selected
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return '', ''
+        return name, digest
+
+    @classmethod
+    def _build_policy_provenance(cls, task_info) -> dict:
+        """Snapshot policy identity without hashing large model weights."""
+        policy_path = str(getattr(task_info, 'policy_path', '') or '')
+        artifact_files = cls._artifact_files(policy_path)
+        artifacts = [
+            {'name': name, 'size_bytes': size}
+            for name, _path, size in artifact_files
+        ]
+        manifest_json = json.dumps(
+            artifacts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+        config_path, config_sha256 = cls._select_small_config(artifact_files)
+        return {
+            'schema_version': cls._PROVENANCE_SCHEMA_VERSION,
+            'service_type': str(
+                getattr(task_info, 'service_type', '') or ''
+            ),
+            'policy_type': str(getattr(task_info, 'policy_type', '') or ''),
+            'policy_path': policy_path,
+            'checkpoint_id': cls._checkpoint_id(policy_path),
+            'control_hz': int(getattr(task_info, 'control_hz', 0) or 0),
+            'inference_hz': int(getattr(task_info, 'inference_hz', 0) or 0),
+            'config_path': config_path,
+            'config_sha256': config_sha256,
+            'artifact_manifest_sha256': hashlib.sha256(manifest_json).hexdigest(),
+            'artifacts': artifacts,
+        }
+
+    @staticmethod
+    def _find_robot_config_path(robot_type: str) -> Path:
+        """Locate the shared robot config in source, install, or container."""
+        candidates: list[Path] = []
+        for env_var in ('ORCHESTRATOR_CONFIG_PATH', 'ROBOT_CLIENT_CONFIG_DIR'):
+            directory = os.environ.get(env_var)
+            if directory:
+                candidates.append(
+                    Path(directory) / f'{robot_type}_config.yaml'
+                )
+        candidates.append(
+            Path('/orchestrator_config') / f'{robot_type}_config.yaml'
+        )
+        for parent in Path(__file__).resolve().parents:
+            candidates.extend((
+                parent / 'share' / 'shared' / 'robot_configs'
+                / f'{robot_type}_config.yaml',
+                parent / 'shared' / 'robot_configs'
+                / f'{robot_type}_config.yaml',
+                parent / 'shared' / 'shared' / 'robot_configs'
+                / f'{robot_type}_config.yaml',
+            ))
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(
+            f'Robot config for {robot_type!r} not found: '
+            f'{[str(path) for path in candidates]}'
+        )
+
+    def _build_act_rl_episode_contract(self) -> dict:
+        """Build the raw ACT RL contract from shared YAML insertion order."""
+        config_path = self._find_robot_config_path(self._robot_type)
+        with config_path.open('r', encoding='utf-8') as stream:
+            raw = yaml.safe_load(stream) or {}
+        section = raw['orchestrator']['ros__parameters'][self._robot_type]
+        observation = section.get('observation') or {}
+        cameras_cfg = observation.get('images') or {}
+        state_cfg = observation.get('state') or {}
+        action_cfg = section.get('action') or {}
+
+        state_names: list[str] = []
+        state_topics: list[str] = []
+        for group in state_cfg.values():
+            if not isinstance(group, dict):
+                continue
+            state_names.extend(str(name) for name in group.get('joint_names') or [])
+            topic = str(group.get('topic') or '')
+            if topic:
+                state_topics.append(topic)
+
+        action_names: list[str] = []
+        action_topics: list[str] = []
+        for group in action_cfg.values():
+            if not isinstance(group, dict):
+                continue
+            action_names.extend(str(name) for name in group.get('joint_names') or [])
+            topic = str(group.get('topic') or '')
+            if topic:
+                action_topics.append(topic)
+
+        if len(state_names) != self._ACT_ACTION_DIM:
+            raise ValueError(
+                f'ACT state contract must be {self._ACT_ACTION_DIM}D; '
+                f'shared config has {len(state_names)} names'
+            )
+        if len(action_names) != self._ACT_ACTION_DIM:
+            raise ValueError(
+                f'ACT action contract must be {self._ACT_ACTION_DIM}D; '
+                f'shared config has {len(action_names)} names'
+            )
+        camera_names = [str(name) for name in cameras_cfg]
+        if len(camera_names) != 3:
+            raise ValueError(
+                f'ACT camera contract must contain 3 cameras; '
+                f'shared config has {len(camera_names)}'
+            )
+
+        return {
+            'schema_version': self._RL_CONTRACT_SCHEMA_VERSION,
+            'collection_id': self._collection_id,
+            # Recording-session identity.  This is intentionally not the
+            # uint64 ActionChunk.session_id generated by control_loop.
+            'session_id': self._collection_id,
+            'cameras': {
+                'names': camera_names,
+                'image_shape': [3, 256, 256],
+            },
+            'state': {
+                'dim': len(state_names),
+                'names': state_names,
+                'topics': state_topics,
+            },
+            'action': {
+                'dim': len(action_names),
+                'names': action_names,
+                'topics': action_topics,
+                'hz': self._ACT_TARGET_HZ,
+            },
+            'chunk': {
+                'size': self._ACT_CHUNK_SIZE,
+                'action_dim': self._ACT_ACTION_DIM,
+                'topic': self._ACTION_CHUNK_TOPIC,
+                'ack_topic': self._ACTION_STEP_ACK_TOPIC,
+            },
+            'terminal_reward': {
+                'semantics': 'binary_terminal',
+                'success': 1.0,
+                'failure': 0.0,
+                'intermediate': 0.0,
+            },
+        }
+
+    @classmethod
+    def _make_save_repo_name(
+        cls,
+        save_root_path,
+        task_info,
+        collection_id: str = '',
+    ) -> str:
+        """Return a task-folder basename without mutating TaskInfo."""
         task_type = getattr(task_info, 'task_type', '') or ''
         if task_type == 'inference':
-            record_id = cls._make_unique_inference_record_id(save_root_path)
-            task_info.task_num = record_id
-            task_info.task_name = 'inference'
-            return f'Task_{record_id}_inference_MCAP'
+            record_id = str(collection_id or '').strip()
+            if not record_id:
+                record_id = cls._make_unique_inference_record_id(
+                    save_root_path,
+                    policy_type=getattr(task_info, 'policy_type', ''),
+                )
+            return f'{cls.validate_collection_id(record_id)}_MCAP'
 
         task_num = getattr(task_info, 'task_num', '') or ''
         task_name = getattr(task_info, 'task_name', '') or ''
+        task_num = cls.validate_record_path_component(task_num, 'task_num')
+        task_name = cls.validate_record_path_component(task_name, 'task_name')
         return f'Task_{task_num}_{task_name}_MCAP'
 
     @staticmethod
-    def _make_unique_inference_record_id(save_root_path) -> str:
+    def validate_record_path_component(value: str, field_name: str) -> str:
+        """Preserve display text while rejecting filesystem traversal."""
+        text = str(value or '')
+        if (
+            '\x00' in text
+            or '/' in text
+            or '\\' in text
+            or text in {'.', '..'}
+        ):
+            raise ValueError(
+                f'Invalid recording {field_name} path component: {text!r}'
+            )
+        return text
+
+    @staticmethod
+    def _validated_dataset_path(dataset_root: Path, repo_name: str) -> Path:
+        """Return a non-symlink dataset path contained by ``dataset_root``."""
+        dataset_root = Path(dataset_root)
+        if dataset_root.is_symlink():
+            raise ValueError(f'Dataset root must not be a symlink: {dataset_root}')
+        candidate = dataset_root / repo_name
+        if candidate.is_symlink():
+            raise ValueError(f'Dataset path must not be a symlink: {candidate}')
+        resolved_root = dataset_root.resolve(strict=False)
+        resolved_candidate = candidate.resolve(strict=False)
+        try:
+            resolved_candidate.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError(
+                f'Dataset path escapes save root: {candidate}'
+            ) from exc
+        return candidate
+
+    @staticmethod
+    def validate_collection_id(collection_id: str) -> str:
+        raw_value = str(collection_id or '')
+        value = raw_value.strip()
+        if raw_value != value:
+            raise ValueError(f'Invalid inference collection_id: {raw_value!r}')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,159}', value):
+            raise ValueError(f'Invalid inference collection_id: {value!r}')
+        if '..' in value:
+            raise ValueError(f'Invalid inference collection_id: {value!r}')
+        return value
+
+    @classmethod
+    def _make_unique_inference_record_id(
+        cls,
+        save_root_path,
+        policy_type: str = '',
+    ) -> str:
         timestamp = time.strftime('%Y%m%d_%H%M%S', time.gmtime())
-        root = Path(save_root_path)
-        record_id = timestamp
+        dataset_name = (
+            'ACT_dataset'
+            if str(policy_type or '').strip().lower() == 'act'
+            else 'Inference_dataset'
+        )
+        root = Path(save_root_path) / 'inference'
+        record_id = f'{dataset_name}_{timestamp}'
         suffix = 1
-        while (root / f'Task_{record_id}_inference_MCAP').exists():
-            record_id = f'{timestamp}_{suffix:02d}'
+        while (root / f'{record_id}_MCAP').exists():
+            record_id = f'{dataset_name}_{timestamp}_{suffix:02d}'
             suffix += 1
         return record_id
 
@@ -350,6 +700,35 @@ class DataManager:
             f'existing={sorted(existing_counts)}, requested={requested}. '
             'Use a new task folder for a different Number of Subtasks.'
         )
+
+    def _recover_complete_segment_archives(self) -> list[Path]:
+        """Finalize complete episodes whose ``segments/`` survived a crash."""
+        root = Path(self._save_rosbag_path)
+        if not root.exists():
+            return []
+        recovered: list[Path] = []
+        for full_dir in sorted(
+            (
+                path for path in root.iterdir()
+                if path.is_dir() and path.name.isdigit()
+            ),
+            key=lambda path: int(path.name),
+        ):
+            if not (full_dir / 'segments').is_dir():
+                continue
+            full_idx = int(full_dir.name)
+            saved = self.saved_subtask_indices_for_full_episode(full_idx)
+            if saved != set(range(self._physical_segment_total)):
+                continue
+            errors = self.full_episode_archive_errors(full_idx)
+            if errors:
+                raise RuntimeError(
+                    f'Cannot recover episode {full_idx}: {"; ".join(errors)}'
+                )
+            archived = self._archive_full_episode(full_idx)
+            if archived is not None:
+                recovered.append(Path(archived))
+        return recovered
 
     def _iter_subtask_episode_dirs(self) -> list[Path]:
         """Return all saved raw segment rosbag dirs, old flat + new nested."""
@@ -456,6 +835,17 @@ class DataManager:
             if text:
                 return text
         return ''
+
+    @classmethod
+    def _resolve_main_task_instruction(cls, task_info) -> tuple[str, str]:
+        instruction = cls._get_main_task_instruction(task_info)
+        if instruction:
+            return instruction, 'user'
+        task_type = str(getattr(task_info, 'task_type', '') or '')
+        policy_type = str(getattr(task_info, 'policy_type', '') or '').lower()
+        if task_type == 'inference' and policy_type == 'act':
+            return 'ACT_dataset', 'fallback'
+        return '', 'empty'
 
     @staticmethod
     def _get_subtask_instructions(task_info) -> list:
@@ -924,15 +1314,7 @@ class DataManager:
 
         for subtask_idx, seg_dir in enumerate(ordered):
             seg_info = self._read_episode_info(seg_dir)
-            src_mcaps = sorted(seg_dir.glob('*.mcap'))
             dst_prefix = f'{full_idx}_{subtask_idx}'
-            archived_mcaps = (
-                sorted(out_dir.glob(f'{dst_prefix}.mcap'))
-                + sorted(out_dir.glob(f'{dst_prefix}_*.mcap'))
-            )
-            mcaps = src_mcaps or archived_mcaps
-            if not mcaps:
-                raise FileNotFoundError(f'No .mcap file in {seg_dir}')
             meta_path = seg_dir / 'metadata.yaml'
             if not meta_path.exists():
                 raise FileNotFoundError(f'No metadata.yaml in {seg_dir}')
@@ -940,16 +1322,96 @@ class DataManager:
                 metadata = yaml.safe_load(f) or {}
             bag_info = metadata.get('rosbag2_bagfile_information', {}) or {}
             files_info = bag_info.get('files') or []
+            relative_paths = [
+                str(path) for path in (
+                    bag_info.get('relative_file_paths') or []
+                ) if str(path)
+            ]
+            if not relative_paths and files_info:
+                relative_paths = [
+                    str(entry.get('path') or '')
+                    for entry in files_info
+                    if str(entry.get('path') or '')
+                ]
+
+            src_mcaps = sorted(seg_dir.glob('*.mcap'))
+            archived_mcaps = (
+                sorted(out_dir.glob(f'{dst_prefix}.mcap'))
+                + sorted(out_dir.glob(f'{dst_prefix}_*.mcap'))
+            )
+            expected_count = max(len(relative_paths), len(files_info))
+            if expected_count == 0:
+                split_indices = []
+                for archived in archived_mcaps:
+                    match = re.fullmatch(
+                        rf'{re.escape(dst_prefix)}_(\d+)\.mcap',
+                        archived.name,
+                    )
+                    if match:
+                        split_indices.append(int(match.group(1)))
+                expected_count = max(
+                    len(src_mcaps) + len(archived_mcaps),
+                    (max(split_indices) + 1) if split_indices else 0,
+                )
+            if expected_count == 0:
+                raise FileNotFoundError(f'No .mcap file in {seg_dir}')
+
+            archived_by_index = {}
+            for archived in archived_mcaps:
+                if archived.name == f'{dst_prefix}.mcap':
+                    archived_by_index[0] = archived
+                    continue
+                match = re.fullmatch(
+                    rf'{re.escape(dst_prefix)}_(\d+)\.mcap',
+                    archived.name,
+                )
+                if match:
+                    archived_by_index[int(match.group(1))] = archived
+
+            remaining_sources = list(src_mcaps)
+            mcaps = []
+            for split_idx in range(expected_count):
+                dst_name = dst_prefix
+                if expected_count > 1:
+                    dst_name += f'_{split_idx}'
+                dst_name += '.mcap'
+                dst_path = out_dir / dst_name
+                src_mcap = None
+                has_metadata_identity = split_idx < len(relative_paths)
+                if has_metadata_identity:
+                    candidate = seg_dir / Path(relative_paths[split_idx]).name
+                    if candidate in remaining_sources:
+                        src_mcap = candidate
+                        remaining_sources.remove(candidate)
+                if (
+                    src_mcap is None
+                    and not has_metadata_identity
+                    and self._file_size_if_present(dst_path) <= 0
+                    and remaining_sources
+                ):
+                    src_mcap = remaining_sources.pop(0)
+
+                if src_mcap is not None:
+                    self._move_file(src_mcap, dst_path)
+                elif self._file_size_if_present(dst_path) <= 0:
+                    prior_dst = archived_by_index.get(split_idx)
+                    if prior_dst is not None and prior_dst != dst_path:
+                        self._move_file(prior_dst, dst_path)
+                    else:
+                        raise FileNotFoundError(
+                            'Missing MCAP split '
+                            f'{split_idx}/{expected_count} in {seg_dir}'
+                        )
+                if self._file_size_if_present(dst_path) <= 0:
+                    raise FileNotFoundError(
+                        f'Archived MCAP split is empty: {dst_path}'
+                    )
+                mcaps.append(dst_path)
+
             segment_duration_ns = 0
 
-            for split_idx, src_mcap in enumerate(mcaps):
-                dst_name = f'{full_idx}_{subtask_idx}'
-                if len(mcaps) > 1:
-                    dst_name += f'_{split_idx}'
-                dst_name += src_mcap.suffix
-                dst_path = out_dir / dst_name
-                if src_mcap.resolve() != dst_path.resolve():
-                    self._move_file(src_mcap, dst_path)
+            for split_idx, dst_path in enumerate(mcaps):
+                dst_name = dst_path.name
                 output_files.append(dst_path)
 
                 file_info = files_info[split_idx] if split_idx < len(files_info) else {}
@@ -1054,26 +1516,66 @@ class DataManager:
             yaml.safe_dump(unified, f, default_flow_style=False, sort_keys=False)
 
         self._copy_episode_sidecars(ordered, out_dir)
-        video_segments, video_warnings = self._archive_episode_videos(
-            ordered, out_dir, full_idx,
+        video_segments, video_warnings, video_archive_errors = (
+            self._archive_episode_videos(
+                ordered, out_dir, full_idx,
+            )
         )
+        if video_archive_errors:
+            details = '; '.join(
+                f'{segment}/{camera}: {message}'
+                for segment, cameras in sorted(video_archive_errors.items())
+                for camera, message in sorted(cameras.items())
+            )
+            raise RuntimeError(
+                f'Cannot archive episode {full_idx} videos: {details}'
+            )
         has_transcodable_videos = any(
             bool(segment.get('cameras')) for segment in video_segments
         )
         has_pending_remux = any(
             bool(segment.get('raw_cameras')) for segment in video_segments
         )
+        recorded_video_segments = [
+            segment for segment in video_segments
+            if segment.get('cameras')
+        ]
+
+        segment_infos = [self._read_episode_info(path) for path in ordered]
+
+        def consistent_segment_value(key):
+            values = [info[key] for info in segment_infos if key in info]
+            if not values:
+                return None
+            first = values[0]
+            if any(value != first for value in values[1:]):
+                raise RuntimeError(
+                    f'Cannot archive episode {full_idx}: inconsistent {key}'
+                )
+            return first
 
         summary = {
-            'task_instruction': self._main_task_instruction,
-            'task_num': getattr(self._task_info, 'task_num', '') or '',
-            'task_name': getattr(self._task_info, 'task_name', '') or '',
+            'task_instruction': (
+                consistent_segment_value('task_instruction')
+                or self._main_task_instruction
+            ),
+            'task_num': (
+                consistent_segment_value('task_num')
+                or getattr(self._task_info, 'task_num', '')
+                or ''
+            ),
+            'task_name': (
+                consistent_segment_value('task_name')
+                or getattr(self._task_info, 'task_name', '')
+                or ''
+            ),
             'robot_type': self._robot_type,
             'device_serial': socket.gethostname(),
             'episode_index': full_idx,
             'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'format_version': 'robotis_v2',
             'segments': segments_meta,
+            'video_segments': recorded_video_segments,
             'transcoding_status': (
                 'pending' if has_transcodable_videos else 'not_required'
             ),
@@ -1082,12 +1584,21 @@ class DataManager:
                 else ('done' if has_transcodable_videos else 'not_required')
             ),
         }
+        for key in (
+            'task_type',
+            'policy_type',
+            'collection_id',
+            'task_instruction_source',
+            'policy_provenance',
+            'rl_episode_contract',
+            'outcome',
+        ):
+            value = consistent_segment_value(key)
+            if value is not None:
+                summary[key] = value
         if video_warnings:
             summary['video_warnings'] = video_warnings
-        try:
-            _atomic_write_json(out_dir / 'episode_info.json', summary)
-        except Exception as e:
-            print(f'[ROBOTIS] Failed to save full episode summary: {e}')
+        _atomic_write_json(out_dir / 'episode_info.json', summary)
 
         segments_root = out_dir / 'segments'
         if segments_root.exists():
@@ -1225,12 +1736,17 @@ class DataManager:
         subtask_dirs: list[Path],
         out_dir: Path,
         full_idx: int,
-    ) -> tuple[list[dict], dict[str, dict[str, str]]]:
+    ) -> tuple[
+        list[dict],
+        dict[str, dict[str, str]],
+        dict[str, dict[str, str]],
+    ]:
         dst_videos = out_dir / 'videos'
         dst_videos.mkdir(parents=True, exist_ok=True)
 
         video_segments = []
         warnings: dict[str, dict[str, str]] = {}
+        archive_errors: dict[str, dict[str, str]] = {}
         for subtask_idx, seg_dir in enumerate(subtask_dirs):
             prefix = f'{full_idx}_{subtask_idx}'
             seg_info = DataManager._read_episode_info(seg_dir)
@@ -1251,9 +1767,19 @@ class DataManager:
                 expected_cameras.update(str(name) for name in video_stats)
 
             dst_segment_dir = dst_videos / prefix
+            if dst_segment_dir.exists():
+                expected_cameras.update(
+                    path.stem for path in dst_segment_dir.glob('*.mp4')
+                )
+                expected_cameras.update(
+                    path.name[:-len('.mjpeg.tmp')]
+                    for path in dst_segment_dir.glob('*.mjpeg.tmp')
+                    if DataManager._file_size_if_present(path) > 0
+                )
             segment_cameras = []
             segment_raw_cameras = []
             segment_warnings = {}
+            segment_errors = {}
             for camera in sorted(expected_cameras):
                 src = seg_videos / f'{camera}.mp4'
                 raw_spool = seg_videos / f'{camera}.mjpeg.tmp'
@@ -1265,44 +1791,52 @@ class DataManager:
                 dst_sidecar = dst_segment_dir / f'{camera}_timestamps.parquet'
                 dst_stats = dst_segment_dir / f'{camera}_recorder_stats.json'
                 dst_diagnostics = dst_segment_dir / f'{camera}_diagnostics.parquet'
-                has_mp4 = DataManager._file_size_if_present(src) > 0
-                has_raw_spool = DataManager._file_size_if_present(raw_spool) > 0
-                if not has_mp4 and not has_raw_spool:
-                    if (
-                        (dst.exists() or dst_raw_spool.exists())
-                        and dst_sidecar.exists()
-                    ):
-                        segment_cameras.append(camera)
-                        if dst_raw_spool.exists():
-                            segment_raw_cameras.append(camera)
-                        continue
+                has_src_mp4 = DataManager._file_size_if_present(src) > 0
+                has_src_raw = DataManager._file_size_if_present(raw_spool) > 0
+                has_dst_mp4 = DataManager._file_size_if_present(dst) > 0
+                has_dst_raw = DataManager._file_size_if_present(dst_raw_spool) > 0
+                has_video = (
+                    has_src_mp4 or has_src_raw or has_dst_mp4 or has_dst_raw
+                )
+                has_sidecar = (
+                    DataManager._file_size_if_present(sidecar) > 0
+                    or DataManager._file_size_if_present(dst_sidecar) > 0
+                )
+                if not has_video:
                     segment_warnings[camera] = 'missing video file'
                     continue
-                if DataManager._file_size_if_present(sidecar) <= 0:
-                    if (
-                        (dst.exists() or dst_raw_spool.exists())
-                        and dst_sidecar.exists()
-                    ):
-                        segment_cameras.append(camera)
-                        if dst_raw_spool.exists():
-                            segment_raw_cameras.append(camera)
-                        continue
+                if not has_sidecar:
                     segment_warnings[camera] = 'missing timestamp sidecar'
+                    segment_errors[camera] = 'missing timestamp sidecar'
                     continue
                 try:
-                    if has_mp4:
+                    if has_src_mp4:
                         DataManager._move_file(src, dst)
-                    if has_raw_spool:
+                    if has_src_raw:
                         DataManager._move_file(raw_spool, dst_raw_spool)
-                        segment_raw_cameras.append(camera)
-                    DataManager._move_file(sidecar, dst_sidecar)
+                    if DataManager._file_size_if_present(sidecar) > 0:
+                        DataManager._move_file(sidecar, dst_sidecar)
                     if DataManager._file_size_if_present(stats) > 0:
                         DataManager._move_file(stats, dst_stats)
                     if DataManager._file_size_if_present(diagnostics) > 0:
                         DataManager._move_file(diagnostics, dst_diagnostics)
+                    final_has_video = (
+                        DataManager._file_size_if_present(dst) > 0
+                        or DataManager._file_size_if_present(dst_raw_spool) > 0
+                    )
+                    final_has_sidecar = (
+                        DataManager._file_size_if_present(dst_sidecar) > 0
+                    )
+                    if not final_has_video or not final_has_sidecar:
+                        raise RuntimeError(
+                            'archived video/timestamp pair verification failed'
+                        )
+                    if DataManager._file_size_if_present(dst_raw_spool) > 0:
+                        segment_raw_cameras.append(camera)
                     segment_cameras.append(camera)
                 except Exception as exc:
                     segment_warnings[camera] = repr(exc)
+                    segment_errors[camera] = repr(exc)
             video_segments.append({
                 'mcap': f'{prefix}.mcap',
                 'video_dir': f'videos/{prefix}',
@@ -1311,8 +1845,10 @@ class DataManager:
             })
             if segment_warnings:
                 warnings[prefix] = segment_warnings
+            if segment_errors:
+                archive_errors[prefix] = segment_errors
 
-        return video_segments, warnings
+        return video_segments, warnings, archive_errors
 
     def update_task_info(self, task_info):
         """Refresh per-session config from a new task_info.
@@ -1326,7 +1862,10 @@ class DataManager:
         previous_subtask_mode = getattr(self, '_subtask_mode', False)
         previous_segment_total = getattr(self, '_physical_segment_total', 1)
         self._task_info = task_info
-        self._main_task_instruction = self._get_main_task_instruction(task_info)
+        (
+            self._main_task_instruction,
+            self._task_instruction_source,
+        ) = self._resolve_main_task_instruction(task_info)
         self._subtask_instructions = self._get_subtask_instructions(task_info)
         self._subtask_mode = bool(self._subtask_instructions)
         self._subtask_total = len(self._subtask_instructions)
@@ -1415,6 +1954,7 @@ class DataManager:
         camera_rotations: dict | None = None,
         image_topics: dict | None = None,
         camera_info_topics: dict | None = None,
+        episode_outcome: dict | None = None,
     ):
         """
         Save URDF and metadata for ROBOTIS format.
@@ -1493,10 +2033,19 @@ class DataManager:
             camera_rotations=camera_rotations,
         )
 
+        metadata_timestamp = time.strftime(
+            '%Y-%m-%dT%H:%M:%SZ', time.gmtime()
+        )
         meta_data = {
             'task_instruction': self._main_task_instruction,
+            'task_instruction_source': self._task_instruction_source,
             'task_num': getattr(self._task_info, 'task_num', '') or '',
             'task_name': getattr(self._task_info, 'task_name', '') or '',
+            'task_type': self._task_type,
+            'policy_type': (
+                getattr(self._task_info, 'policy_type', '') or ''
+            ),
+            'collection_id': self._collection_id,
             'recording_mode': 'subtask' if self._subtask_mode else 'single_segment',
             'subtask_storage_layout': 'nested',
             'subtask_instruction': current_subtask_instruction,
@@ -1506,7 +2055,7 @@ class DataManager:
             'subtask_total': self._physical_segment_total,
             'robot_type': self._robot_type,
             'episode_index': raw_episode_index,
-            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'timestamp': metadata_timestamp,
             'format_version': 'robotis_v2',
             'device_serial': socket.gethostname(),
             'video_stats': video_stats or {},
@@ -1517,19 +2066,36 @@ class DataManager:
             ),
         }
 
+        # Inference recordings are self-describing RL inputs: the policy
+        # identity and the raw ACT layout are captured once at DataManager
+        # construction and copied verbatim to every segment.  Ordinary
+        # teleoperation recordings intentionally keep their existing schema.
+        if self._task_type == 'inference':
+            if self._policy_provenance is not None:
+                meta_data['policy_provenance'] = self._policy_provenance
+            if self._rl_episode_contract is not None:
+                meta_data['rl_episode_contract'] = self._rl_episode_contract
+
+        if episode_outcome is not None:
+            normalized_outcome = dict(episode_outcome)
+            normalized_outcome.setdefault('schema_version', 1)
+            normalized_outcome['annotated_at'] = (
+                metadata_timestamp
+                if normalized_outcome.get('status') in {'success', 'failure'}
+                else None
+            )
+            meta_data['outcome'] = normalized_outcome
+
         meta_data_path = os.path.join(rosbag_path, 'episode_info.json')
-        try:
-            _atomic_write_json(meta_data_path, meta_data)
-            print(f'[ROBOTIS] Metadata saved to: {meta_data_path}')
-            if self._segmented_storage_mode:
-                cache = getattr(self, '_saved_subtasks_cache', {})
-                cache.setdefault(
-                    int(full_episode_index),
-                    set(),
-                ).add(int(subtask_index))
-                self._saved_subtasks_cache = cache
-        except Exception as e:
-            print(f'[ROBOTIS] Failed to save metadata: {e}')
+        _atomic_write_json(meta_data_path, meta_data)
+        print(f'[ROBOTIS] Metadata saved to: {meta_data_path}')
+        if self._segmented_storage_mode:
+            cache = getattr(self, '_saved_subtasks_cache', {})
+            cache.setdefault(
+                int(full_episode_index),
+                set(),
+            ).add(int(subtask_index))
+            self._saved_subtasks_cache = cache
 
     def should_record_rosbag2(self):
         """In simplified mode, always record rosbag2."""

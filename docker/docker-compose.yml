@@ -178,6 +178,20 @@ services:
       # Main-runtime waits on the local engine process while weights and
       # first-time gated backbones download/load.
       - LOAD_POLICY_TIMEOUT_S=${LOAD_POLICY_TIMEOUT_S:-7200}
+      # ACT produces 30 native action rows.  For the SG2 showroom contract,
+      # execute those rows one-for-one at the 15 Hz environment step instead
+      # of interpolating them into the legacy 100 Hz robot-control stream.
+      # Keep every value overrideable for policies with a different contract.
+      - INFERENCE_HZ=${LEROBOT_INFERENCE_HZ:-15.0}
+      - CONTROL_HZ=${LEROBOT_CONTROL_HZ:-15.0}
+      - TARGET_CHUNK_SIZE=${LEROBOT_TARGET_CHUNK_SIZE:-30}
+      - ACTION_REQUEST_MODE=${LEROBOT_ACTION_REQUEST_MODE:-sync}
+      # Keep ACT's native 30 rows in the Main runtime queue.  The 15 Hz
+      # control loop pops exactly one unmodified 22D row per tick and sends it
+      # through the same RobotClient command topics used by GR00T.
+      - POSTPROCESS_ACTIONS=${LEROBOT_POSTPROCESS_ACTIONS:-false}
+      - ACTION_EXECUTION_MODE=${LEROBOT_ACTION_EXECUTION_MODE:-row}
+      - ACTION_CHUNK_ACK_TIMEOUT_S=${LEROBOT_ACTION_CHUNK_ACK_TIMEOUT_S:-30.0}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
       - PYTHONUNBUFFERED=1

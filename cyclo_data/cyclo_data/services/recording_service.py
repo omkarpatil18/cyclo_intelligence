@@ -33,6 +33,7 @@ Session-state boundary (REVIEW §9.3):
 import shutil
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from cyclo_data.recorder.camera_info_snapshot import CameraInfoSnapshot
@@ -75,9 +76,9 @@ class RecordingService:
     STATUS_TOPIC = '/data/recording/status'
     STATUS_PERIOD_SEC = 0.2  # 5 Hz
 
-    # Matches orchestrator.OrchestratorNode.DEFAULT_SAVE_ROOT_PATH so the
-    # on-disk layout is identical during the C2d-3 → C2d-4 handoff.
-    DEFAULT_SAVE_ROOT_PATH = Path.home() / '.cache/huggingface/lerobot'
+    # Raw MCAP/video recordings live in the Docker workspace. The host bind
+    # mount mirrors this at cyclo_intelligence/docker/workspace/rosbag2.
+    DEFAULT_SAVE_ROOT_PATH = Path('/workspace/rosbag2')
 
     def __init__(self, node, status_publisher):
         self._node = node
@@ -122,6 +123,7 @@ class RecordingService:
         self._session_lock = threading.Lock()
         self._finish_episode_lock = threading.Lock()
         self._finish_episode_thread: Optional[threading.Thread] = None
+        self._finish_episode_error: str = ''
 
         # Idle-state metrics: filled into the 5 Hz status publish before any
         # session_manager exists so the UI's CPU/RAM/Storage panel keeps
@@ -207,11 +209,41 @@ class RecordingService:
             thread = self._finish_episode_thread
             return thread is not None and thread.is_alive()
 
+    def _block_for_pending_archive(
+        self,
+        response,
+        command_name: str,
+    ) -> bool:
+        """Block manager replacement until the previous archive is safe."""
+        if self._finish_episode_in_progress():
+            response.success = False
+            response.message = (
+                f'{command_name} blocked: episode archive still running'
+            )
+            return True
+        archive_error = str(getattr(self, '_finish_episode_error', '') or '')
+        if not archive_error:
+            return False
+        manager = getattr(self, '_data_manager', None)
+        retry_started = bool(
+            manager is not None
+            and self._start_finish_episode_thread(manager)
+        )
+        response.success = False
+        response.message = (
+            f'{command_name} blocked: retrying failed episode archive'
+            if retry_started
+            else f'{command_name} blocked: previous episode archive failed'
+        )
+        response.message += f' ({archive_error})'
+        return True
+
     def _start_finish_episode_thread(self, data_manager: DataManager) -> bool:
         with self._finish_episode_lock:
             thread = self._finish_episode_thread
             if thread is not None and thread.is_alive():
                 return False
+            self._finish_episode_error = ''
             thread = threading.Thread(
                 target=self._finish_episode_worker,
                 args=(data_manager,),
@@ -240,6 +272,8 @@ class RecordingService:
                 ):
                     self._submit_transcode(archived_dir)
         except Exception as exc:  # noqa: BLE001
+            with self._finish_episode_lock:
+                self._finish_episode_error = str(exc)
             self._node.get_logger().error(
                 f'FINISH_EPISODE archive failed: {exc!r}')
             self._publish_umbrella_status(
@@ -248,6 +282,8 @@ class RecordingService:
                 f'Episode finish failed: {exc}',
             )
         else:
+            with self._finish_episode_lock:
+                self._finish_episode_error = ''
             self._publish_umbrella_status(
                 DataOperationStatus.COMPLETED,
                 'FINISH_EPISODE',
@@ -262,18 +298,54 @@ class RecordingService:
     # DataManager management
     # ------------------------------------------------------------------
 
-    def _ensure_data_manager(self, task_info, robot_type: str) -> DataManager:
+    def _ensure_data_manager(
+        self,
+        task_info,
+        robot_type: str,
+        collection_id: str = '',
+    ) -> DataManager:
         with self._session_lock:
             self._robot_type = robot_type
             existing = self._data_manager
             if existing is not None and existing.is_recording():
+                existing_collection = str(
+                    getattr(existing, '_collection_id', '') or ''
+                )
+                requested_collection = str(collection_id or '')
+                if existing_collection != requested_collection:
+                    raise RuntimeError(
+                        'Cannot switch recording collection while an episode '
+                        f'is active: active={existing_collection or "record"}, '
+                        f'requested={requested_collection or "record"}'
+                    )
                 return existing
         save_repo_name = DataManager._make_save_repo_name(
             self.DEFAULT_SAVE_ROOT_PATH,
             task_info,
+            collection_id=collection_id,
         )
-        if (existing is not None
-                and getattr(existing, '_save_repo_name', None) == save_repo_name):
+        requested_task_type = str(
+            getattr(task_info, 'task_type', '') or ''
+        )
+        requested_collection = (
+            str(collection_id or '') if requested_task_type == 'inference'
+            else ''
+        )
+        requested_root = Path(self.DEFAULT_SAVE_ROOT_PATH)
+        if requested_task_type == 'inference':
+            requested_root = requested_root / 'inference'
+        requested_save_path = requested_root / save_repo_name
+        same_manager_identity = bool(
+            existing is not None
+            and str(getattr(existing, '_task_type', '') or '')
+            == requested_task_type
+            and str(getattr(existing, '_collection_id', '') or '')
+            == requested_collection
+            and Path(getattr(existing, '_save_path', ''))
+            == requested_save_path
+            and str(getattr(existing, '_robot_type', '') or '') == robot_type
+        )
+        if same_manager_identity:
             # Same task as before — reuse existing manager but refresh
             # its task_info so per-session knobs (e.g. UI's
             # include_robotis_license checkbox) flipped between
@@ -285,18 +357,20 @@ class RecordingService:
             save_root_path=self.DEFAULT_SAVE_ROOT_PATH,
             robot_type=robot_type,
             task_info=task_info,
+            collection_id=collection_id,
         )
-        if (existing is None
-                or getattr(existing, '_save_repo_name', None)
-                != candidate._save_repo_name):
-            with self._session_lock:
-                self._data_manager = candidate
-            self._node.get_logger().info(
-                f'DataManager initialised: repo={candidate._save_repo_name} '
-                f'robot_type={robot_type}')
-            return candidate
-        existing.update_task_info(task_info)
-        return existing
+        with self._session_lock:
+            self._data_manager = candidate
+        self._node.get_logger().info(
+            f'DataManager initialised: repo={candidate._save_repo_name} '
+            f'robot_type={robot_type}')
+        for recovered_dir in getattr(
+            candidate, '_recovered_episode_dirs', []
+        ):
+            recovered_info = DataManager._read_episode_info(recovered_dir)
+            if recovered_info.get('transcoding_status') == 'pending':
+                self._submit_transcode(recovered_dir)
+        return candidate
 
     def _clear_data_manager(self) -> None:
         with self._session_lock:
@@ -387,6 +461,15 @@ class RecordingService:
             self._node.get_logger().warn(response.message)
             return response
 
+        if not self._validate_episode_outcome_request(
+            request, response, command_name
+        ):
+            return response
+        if not self._validate_collection_request(
+            request, response, command_name
+        ):
+            return response
+
         task_num = request.task_info.task_num or '<unset>'
         self._node.get_logger().info(
             f'RecordingCommand.{command_name} received '
@@ -439,6 +522,156 @@ class RecordingService:
                 DataOperationStatus.FAILED, command_name, str(exc))
             return response
 
+    def _validate_episode_outcome_request(
+        self,
+        request,
+        response,
+        command_name: str,
+    ) -> bool:
+        outcome = int(getattr(request, 'episode_outcome', 0) or 0)
+        valid = {
+            RecordingCommand.Request.EPISODE_OUTCOME_UNSPECIFIED,
+            RecordingCommand.Request.EPISODE_OUTCOME_SUCCESS,
+            RecordingCommand.Request.EPISODE_OUTCOME_FAILURE,
+        }
+        if outcome not in valid:
+            response.success = False
+            response.message = f'Invalid episode_outcome: {outcome}'
+            return False
+        if outcome == RecordingCommand.Request.EPISODE_OUTCOME_UNSPECIFIED:
+            return True
+        if request.command != RecordingCommand.Request.STOP:
+            response.success = False
+            response.message = (
+                f'{command_name}: episode_outcome is only valid for STOP'
+            )
+            return False
+        if str(getattr(request.task_info, 'task_type', '') or '') != 'inference':
+            response.success = False
+            response.message = (
+                'Labeled episode_outcome is only valid for inference recording'
+            )
+            return False
+        manager = getattr(self, '_data_manager', None)
+        if str(getattr(manager, '_task_type', '') or '') != 'inference':
+            response.success = False
+            response.message = (
+                'Labeled episode_outcome requires an active inference manager'
+            )
+            return False
+        return True
+
+    def _validate_collection_request(
+        self,
+        request,
+        response,
+        command_name: str,
+    ) -> bool:
+        task_type = str(getattr(request.task_info, 'task_type', '') or '')
+        request_is_inference = task_type == 'inference'
+        collection_id = str(getattr(request, 'collection_id', '') or '')
+        manager = getattr(self, '_data_manager', None)
+        manager_task_type = str(
+            getattr(manager, '_task_type', '') or ''
+        ) if manager is not None else ''
+        manager_recording = bool(
+            manager is not None and manager.is_recording()
+        )
+        identity_commands = {
+            RecordingCommand.Request.STOP,
+            RecordingCommand.Request.FINISH,
+            RecordingCommand.Request.MOVE_TO_NEXT,
+            RecordingCommand.Request.RERECORD,
+            RecordingCommand.Request.SKIP_TASK,
+            RecordingCommand.Request.CANCEL,
+            RecordingCommand.Request.STOP_SEGMENT,
+            RecordingCommand.Request.CANCEL_SEGMENT,
+            RecordingCommand.Request.DISCARD_SEGMENT,
+            RecordingCommand.Request.FINISH_EPISODE,
+            RecordingCommand.Request.DISCARD_EPISODE,
+        }
+        manager_is_inference = manager_task_type == 'inference'
+        targets_existing_manager = (
+            manager is not None and request.command in identity_commands
+        )
+
+        if targets_existing_manager and (
+            request_is_inference != manager_is_inference
+        ):
+            response.success = False
+            response.message = (
+                f'{command_name}: request task_type does not match active '
+                f'{manager_task_type or "record"} manager'
+            )
+            return False
+
+        if not request_is_inference:
+            return True
+
+        if not collection_id:
+            if request.command in {
+                RecordingCommand.Request.SET_TASK_INFO,
+                RecordingCommand.Request.REFRESH_TOPICS,
+            }:
+                return True
+            if (
+                request.command == RecordingCommand.Request.FINISH
+                and not manager_recording
+            ):
+                return True
+            response.success = False
+            response.message = f'{command_name}: inference collection_id is required'
+            return False
+        try:
+            DataManager.validate_collection_id(collection_id)
+        except (TypeError, ValueError) as exc:
+            response.success = False
+            response.message = f'{command_name}: {exc}'
+            return False
+
+        if manager is None:
+            return True
+        manager_collection = str(
+            getattr(manager, '_collection_id', '') or ''
+        )
+        collection_switch_command = request.command in {
+            RecordingCommand.Request.START,
+            RecordingCommand.Request.START_SEGMENT,
+            RecordingCommand.Request.SET_TASK_INFO,
+        }
+        if (
+            manager_task_type == 'inference'
+            and manager_collection != collection_id
+            and not (collection_switch_command and not manager_recording)
+        ):
+            response.success = False
+            response.message = (
+                f'{command_name}: stale inference collection '
+                f'{collection_id!r}; active={manager_collection!r}'
+            )
+            return False
+        return True
+
+    def _episode_outcome_metadata(self, request):
+        manager_task_type = str(
+            getattr(getattr(self, '_data_manager', None), '_task_type', '') or ''
+        )
+        if manager_task_type != 'inference':
+            return None
+        outcome = int(getattr(request, 'episode_outcome', 0) or 0)
+        if outcome == RecordingCommand.Request.EPISODE_OUTCOME_SUCCESS:
+            status, success, source = 'success', True, 'operator_ui'
+        elif outcome == RecordingCommand.Request.EPISODE_OUTCOME_FAILURE:
+            status, success, source = 'failure', False, 'operator_ui'
+        else:
+            status, success, source = 'unlabeled', None, 'unspecified'
+        return {
+            'schema_version': 1,
+            'status': status,
+            'success': success,
+            'source': source,
+        }
+
     # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
@@ -484,6 +717,10 @@ class RecordingService:
         declaration wave. Caching by sorted-tuple lets the no-op case
         (REFRESH_TOPICS already prepared this set, and START hands us
         the same one) skip the round-trip entirely.
+
+        ``prepare_rosbag`` waits for the service response.  Keep the cache
+        assignment after that call so a rejected or timed-out PREPARE remains
+        retryable on the next REFRESH_TOPICS/START.
         """
         new_set = tuple(sorted(topics))
         if new_set == self._last_prepared_topics:
@@ -575,9 +812,7 @@ class RecordingService:
         return image_topics, camera_info_topics, rotations
 
     def _do_start(self, request, response):
-        if self._finish_episode_in_progress():
-            response.success = False
-            response.message = 'START blocked: episode archive still running'
+        if self._block_for_pending_archive(response, 'START'):
             return response
         if not request.robot_type:
             response.success = False
@@ -587,7 +822,11 @@ class RecordingService:
             response.success = False
             response.message = 'rosbag_recorder service unavailable'
             return response
-        dm = self._ensure_data_manager(request.task_info, request.robot_type)
+        dm = self._ensure_data_manager(
+            request.task_info,
+            request.robot_type,
+            collection_id=getattr(request, 'collection_id', '') or '',
+        )
         if dm.is_recording():
             response.success = False
             response.message = 'START blocked: recording already active'
@@ -620,6 +859,7 @@ class RecordingService:
             return response
 
         episode_dir = Path(rosbag_path)
+        episode_preexisting = episode_dir.exists()
         rosbag_started = False
         dm_started = False
         try:
@@ -652,6 +892,7 @@ class RecordingService:
                 episode_dir=episode_dir,
                 data_manager=dm if dm_started else None,
                 rosbag_started=rosbag_started,
+                episode_preexisting=episode_preexisting,
             )
             response.success = False
             response.message = f'START failed: {exc}'
@@ -675,6 +916,7 @@ class RecordingService:
         episode_dir: Path,
         data_manager: Optional[DataManager],
         rosbag_started: bool,
+        episode_preexisting: bool = False,
     ) -> None:
         """Best-effort rollback for failures after rosbag START.
 
@@ -697,7 +939,7 @@ class RecordingService:
                 self._node.get_logger().warning(
                     f'Failed-start rosbag cleanup raised: {exc!r}')
 
-        if episode_dir.exists():
+        if episode_dir.exists() and not episode_preexisting:
             try:
                 shutil.rmtree(episode_dir)
             except Exception as exc:  # noqa: BLE001
@@ -712,11 +954,25 @@ class RecordingService:
                     f'Failed-start DataManager cleanup raised: {exc!r}')
 
     def _do_set_task_info(self, request, response):
+        if self._block_for_pending_archive(response, 'SET_TASK_INFO'):
+            return response
         if not request.robot_type:
             response.success = True
             response.message = 'task_info cached upstream; robot_type not set yet'
             return response
-        self._ensure_data_manager(request.task_info, request.robot_type)
+        task_type = str(getattr(request.task_info, 'task_type', '') or '')
+        collection_id = str(getattr(request, 'collection_id', '') or '')
+        if task_type == 'inference' and not collection_id:
+            response.success = True
+            response.message = (
+                'inference task_info cached upstream; collection not active yet'
+            )
+            return response
+        self._ensure_data_manager(
+            request.task_info,
+            request.robot_type,
+            collection_id=collection_id,
+        )
         self._publish_recording_status()
         response.success = True
         response.message = 'task_info cached'
@@ -767,6 +1023,7 @@ class RecordingService:
         """Called by cyclo_data_node on startup — process any episodes
         left in pending/running state after a previous crash."""
         try:
+            self._recover_pending_inference_archives(workspace_root)
             worker = self._ensure_transcoder()
             futures = worker.submit_pending_recovery(
                 workspace_root, on_complete=self._on_transcode_done,
@@ -779,6 +1036,80 @@ class RecordingService:
             self._node.get_logger().error(
                 f"Transcoder resume scan failed: {exc!r}"
             )
+
+    def _recover_pending_inference_archives(self, workspace_root) -> list[Path]:
+        """Recover complete ``inference/*/segments`` trees after restart."""
+        inference_root = Path(workspace_root) / 'inference'
+        if not inference_root.exists():
+            return []
+        if inference_root.is_symlink():
+            self._node.get_logger().error(
+                f'Inference archive recovery refused symlink root: {inference_root}'
+            )
+            return []
+        resolved_inference_root = inference_root.resolve(strict=False)
+        recovered: list[Path] = []
+        for collection_root in sorted(inference_root.glob('*_MCAP')):
+            if collection_root.is_symlink() or not collection_root.is_dir():
+                self._node.get_logger().warning(
+                    'Inference archive recovery skipped unsafe collection: '
+                    f'{collection_root}'
+                )
+                continue
+            try:
+                collection_root.resolve(strict=False).relative_to(
+                    resolved_inference_root
+                )
+            except ValueError:
+                self._node.get_logger().warning(
+                    'Inference archive recovery skipped escaped collection: '
+                    f'{collection_root}'
+                )
+                continue
+            segment_infos = sorted(
+                collection_root.glob(
+                    '[0-9]*/segments/[0-9]*/episode_info.json'
+                )
+            )
+            if not segment_infos:
+                continue
+            try:
+                info = DataManager._read_episode_info(segment_infos[0].parent)
+                folder_collection_id = collection_root.name[:-len('_MCAP')]
+                metadata_collection_id = str(
+                    info.get('collection_id') or folder_collection_id
+                )
+                if metadata_collection_id != folder_collection_id:
+                    raise ValueError(
+                        'collection_id metadata does not match folder name'
+                    )
+                task_instruction = str(info.get('task_instruction') or '')
+                task_info = SimpleNamespace(
+                    task_num=str(info.get('task_num') or ''),
+                    task_name=str(info.get('task_name') or ''),
+                    task_type='inference',
+                    policy_type=str(info.get('policy_type') or ''),
+                    task_instruction=(
+                        [task_instruction] if task_instruction else []
+                    ),
+                    subtask_instruction=list(
+                        info.get('subtask_instructions') or []
+                    ),
+                    include_robotis_license=False,
+                )
+                manager = DataManager(
+                    save_root_path=Path(workspace_root),
+                    robot_type=str(info.get('robot_type') or ''),
+                    task_info=task_info,
+                    collection_id=folder_collection_id,
+                )
+                recovered.extend(manager._recovered_episode_dirs)
+            except Exception as exc:  # noqa: BLE001
+                self._node.get_logger().error(
+                    'Inference archive recovery failed for '
+                    f'{collection_root}: {exc!r}'
+                )
+        return recovered
 
     def _stop_episode_writers(self):
         """End the current episode, keeping subscribers alive.
@@ -819,7 +1150,8 @@ class RecordingService:
         an inference-only context.
         """
         if self._data_manager is None:
-            response.success = command_name != 'STOP_SEGMENT'
+            labeled = int(getattr(request, 'episode_outcome', 0) or 0) != 0
+            response.success = command_name != 'STOP_SEGMENT' and not labeled
             response.message = (
                 f'{command_name}: no DataManager — no-op'
                 if response.success
@@ -827,7 +1159,8 @@ class RecordingService:
             )
             return response
         if not self._data_manager.is_recording():
-            response.success = command_name != 'STOP_SEGMENT'
+            labeled = int(getattr(request, 'episode_outcome', 0) or 0) != 0
+            response.success = command_name != 'STOP_SEGMENT' and not labeled
             response.message = (
                 f'{command_name}: no active recording — no-op'
                 if response.success
@@ -853,6 +1186,7 @@ class RecordingService:
             camera_rotations=self._last_camera_rotations,
             image_topics=self._last_image_topics,
             camera_info_topics=self._last_camera_info_topics,
+            episode_outcome=self._episode_outcome_metadata(request),
         )
 
         is_segmented_storage = bool(

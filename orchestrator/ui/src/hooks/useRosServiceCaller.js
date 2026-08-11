@@ -18,7 +18,7 @@ import { useCallback, useRef, useEffect } from 'react';
 import { shallowEqual, useSelector } from 'react-redux';
 import ROSLIB from 'roslib';
 import PageType from '../constants/pageType';
-import TaskCommand from '../constants/taskCommand';
+import TaskCommand, { EpisodeOutcome } from '../constants/taskCommand';
 import TrainingCommand from '../constants/trainingCommand';
 import EditDatasetCommand from '../constants/commands';
 import rosConnectionManager from '../utils/rosConnectionManager';
@@ -60,6 +60,23 @@ export function getRecordCommandServiceTimeoutMs(command, options = {}) {
   return command === 'start_inference'
     ? START_INFERENCE_SERVICE_TIMEOUT_MS
     : DEFAULT_SERVICE_TIMEOUT_MS;
+}
+
+export function normalizeEpisodeOutcome(value) {
+  const normalized = Number(value ?? EpisodeOutcome.UNSPECIFIED);
+  return Object.values(EpisodeOutcome).includes(normalized)
+    ? normalized
+    : EpisodeOutcome.UNSPECIFIED;
+}
+
+export function getEpisodeOutcomeForCommand(command, value) {
+  return command === 'stop_inference_record'
+    ? normalizeEpisodeOutcome(value)
+    : EpisodeOutcome.UNSPECIFIED;
+}
+
+export function shouldAutofillEmptyTaskFields(page, optionValue) {
+  return optionValue !== false && page !== PageType.INFERENCE;
 }
 
 export function transformReplayDataResult(result = {}, bagPath = '') {
@@ -320,7 +337,10 @@ export function useRosServiceCaller() {
         // Auto-fill taskName and taskInstruction if empty. Inference-page
         // autosync can opt out so clearing the language prompt propagates as
         // empty instead of being replaced by a generated task name.
-        const autofillEmptyTaskFields = options.autofillEmptyTaskFields !== false;
+        const autofillEmptyTaskFields = shouldAutofillEmptyTaskFields(
+          page,
+          options.autofillEmptyTaskFields
+        );
         let taskName = taskInfo.taskName || '';
         let taskInstruction = (taskInfo.taskInstruction || []).filter(
           (instruction) => instruction.trim() !== ''
@@ -368,9 +388,9 @@ export function useRosServiceCaller() {
           ? String(taskInfo.accelerationEnginePath || '').trim()
           : '';
         const actionRequestMode = (
-          String(taskInfo.actionRequestMode || '').trim().toLowerCase() === 'sync'
-            ? 'sync'
-            : 'async'
+          String(taskInfo.actionRequestMode || '').trim().toLowerCase() === 'async'
+            ? 'async'
+            : 'sync'
         );
         const request = {
           task_info: {
@@ -382,7 +402,7 @@ export function useRosServiceCaller() {
             policy_path: policyPath,
             record_inference_mode: Boolean(taskInfo.recordInferenceMode),
             tags: [`inference_mode:${inferenceMode}`],
-            control_hz: Number(taskInfo.controlHz || 100),
+            control_hz: Number(taskInfo.controlHz || 15),
             inference_hz: Number(taskInfo.inferenceHz || 15),
             chunk_align_window_s: Number(
               taskInfo.chunkAlignWindowS !== '' && taskInfo.chunkAlignWindowS != null
@@ -391,12 +411,17 @@ export function useRosServiceCaller() {
             ),
             include_robotis_license: Boolean(taskInfo.includeRobotisLicense),
             service_type: String(taskInfo.serviceType || ''),
+            policy_type: String(taskInfo.policyType || ''),
             inference_mode: String(inferenceMode),
             action_request_mode: actionRequestMode,
             acceleration_mode: accelerationMode || 'pytorch',
             acceleration_engine_path: accelerationEnginePath,
           },
           command: Number(command_enum),
+          episode_outcome: getEpisodeOutcomeForCommand(
+            command,
+            options.episodeOutcome
+          ),
           segment_index: Number(options.segmentIndex || 0),
           // Conversion-only knobs (ignored by the orchestrator unless
           // command == CONVERT_MP4). Default to 0 / false so the wire

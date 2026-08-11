@@ -6,6 +6,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ActionChunk.msg"
+  "msg/ActionStepAck.msg"
   "msg/BrowserItem.msg"
   "msg/DataOperationStatus.msg"
   "msg/DatasetInfo.msg"

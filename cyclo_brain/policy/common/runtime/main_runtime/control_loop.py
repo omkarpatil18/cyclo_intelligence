@@ -48,6 +48,15 @@ logger = get_logger("main_runtime.control_loop")
 ACTION_REQUEST_MODE_ASYNC = "async"
 ACTION_REQUEST_MODE_SYNC = "sync"
 ACTION_REQUEST_MODES = {ACTION_REQUEST_MODE_ASYNC, ACTION_REQUEST_MODE_SYNC}
+ACTION_EXECUTION_MODE_ROW = "row"
+ACTION_EXECUTION_MODE_CHUNK_ACK = "chunk_ack"
+ACTION_EXECUTION_MODES = {
+    ACTION_EXECUTION_MODE_ROW,
+    ACTION_EXECUTION_MODE_CHUNK_ACK,
+}
+ACTION_STEP_ACK_EXECUTED = 0
+ACTION_STEP_ACK_COMPLETED = 1
+ACTION_STEP_ACK_CANCELLED = 2
 
 
 def normalize_action_request_mode(value: object) -> str:
@@ -55,6 +64,13 @@ def normalize_action_request_mode(value: object) -> str:
     if mode == ACTION_REQUEST_MODE_SYNC:
         return ACTION_REQUEST_MODE_SYNC
     return ACTION_REQUEST_MODE_ASYNC
+
+
+def normalize_action_execution_mode(value: object) -> str:
+    mode = str(value or "").strip().lower()
+    if mode == ACTION_EXECUTION_MODE_CHUNK_ACK:
+        return ACTION_EXECUTION_MODE_CHUNK_ACK
+    return ACTION_EXECUTION_MODE_ROW
 
 
 class ControlLoop:
@@ -73,6 +89,8 @@ class ControlLoop:
         latency_warmup_samples: int = 1,
         max_refill_latency_s: Optional[float] = 2.0,
         action_request_mode: str = ACTION_REQUEST_MODE_ASYNC,
+        action_execution_mode: str = ACTION_EXECUTION_MODE_ROW,
+        action_chunk_ack_timeout_s: float = 30.0,
     ) -> None:
         self._requester = requester
         self._inference_hz = float(inference_hz)
@@ -95,6 +113,14 @@ class ControlLoop:
             action_request_mode
         )
         self._action_request_mode = self._default_action_request_mode
+        self._default_action_execution_mode = normalize_action_execution_mode(
+            action_execution_mode
+        )
+        self._action_execution_mode = self._default_action_execution_mode
+        self._action_chunk_ack_timeout_s = max(
+            0.0,
+            float(action_chunk_ack_timeout_s),
+        )
 
         self._lock = threading.RLock()
         self._robot: Optional[RobotClient] = None
@@ -107,6 +133,14 @@ class ControlLoop:
         self._shutdown = threading.Event()
         self._request_thread: Optional[threading.Thread] = None
         self._thread: Optional[threading.Thread] = None
+        self._chunk_session_id = 0
+        self._next_chunk_seq_id = 0
+        self._awaiting_chunk_seq_id: Optional[int] = None
+        self._awaiting_chunk_size = 0
+        self._awaiting_chunk_started_at: Optional[float] = None
+        self._acked_chunk_steps = 0
+        self._last_action_step_ack_token: Optional[tuple] = None
+        self._action_chunk_timeout_warned = False
 
     def configure(
         self,
@@ -115,6 +149,7 @@ class ControlLoop:
         action_keys: Optional[list[str]] = None,
         publish_to_robot: bool = False,
         action_request_mode: Optional[str] = None,
+        action_execution_mode: Optional[str] = None,
     ) -> None:
         with self._lock:
             self.deconfigure()
@@ -123,10 +158,18 @@ class ControlLoop:
                 if action_request_mode is not None
                 else self._default_action_request_mode
             )
+            self._action_execution_mode = normalize_action_execution_mode(
+                action_execution_mode
+                if action_execution_mode is not None
+                else self._default_action_execution_mode
+            )
             self._robot = RobotClient(
                 robot_type,
                 enable_command_publishers=True,
                 enable_preview_publisher=True,
+                enable_chunk_transport=(
+                    self._action_execution_mode == ACTION_EXECUTION_MODE_CHUNK_ACK
+                ),
             )
             self._processor = ActionChunkProcessor(
                 inference_hz=self._inference_hz,
@@ -139,28 +182,39 @@ class ControlLoop:
             self._task_instruction = task_instruction or ""
             self._action_keys = list(action_keys or self._robot.action_keys)
             self._publish_to_robot = bool(publish_to_robot)
+            self._chunk_session_id = time.time_ns()
+            self._next_chunk_seq_id = 0
+            self._clear_awaiting_chunk_locked()
             self._reset_request_latency_locked()
             self._generation += 1
             logger.info(
                 "configured RobotClient command path for %s "
-                "(publish_to_robot=%s action_request_mode=%s)",
+                "(publish_to_robot=%s action_request_mode=%s "
+                "action_execution_mode=%s session_id=%d)",
                 robot_type,
                 self._publish_to_robot,
                 self._action_request_mode,
+                self._action_execution_mode,
+                self._chunk_session_id,
             )
 
     def deconfigure(self) -> None:
         with self._lock:
+            self._cancel_awaiting_chunk_locked()
             self._running = False
             self._task_instruction = ""
             self._action_keys = []
             self._publish_to_robot = False
             self._action_request_mode = self._default_action_request_mode
+            self._action_execution_mode = self._default_action_execution_mode
             self._processor = None
             self._generation += 1
             if self._robot is not None:
                 self._robot.close()
                 self._robot = None
+            self._chunk_session_id = 0
+            self._next_chunk_seq_id = 0
+            self._clear_awaiting_chunk_locked()
             self._reset_request_latency_locked()
 
     def start(self, publish_to_robot: Optional[bool] = None) -> None:
@@ -171,6 +225,7 @@ class ControlLoop:
 
     def pause(self) -> None:
         with self._lock:
+            self._cancel_awaiting_chunk_locked()
             self._running = False
             if self._processor is not None:
                 self._processor.clear()
@@ -178,6 +233,7 @@ class ControlLoop:
 
     def stop(self) -> None:
         with self._lock:
+            self._cancel_awaiting_chunk_locked()
             self._running = False
             if self._processor is not None:
                 self._processor.clear()
@@ -190,6 +246,8 @@ class ControlLoop:
     def _set_publish_to_robot_locked(self, publish_to_robot: bool) -> None:
         if self._publish_to_robot == publish_to_robot:
             return
+        if self._publish_to_robot and not publish_to_robot:
+            self._cancel_awaiting_chunk_locked()
         self._publish_to_robot = publish_to_robot
         if self._processor is not None:
             self._processor.clear()
@@ -235,26 +293,30 @@ class ControlLoop:
             publish_to_robot = self._publish_to_robot
             action_request_mode = self._action_request_mode
 
-            action = processor.pop_action()
-            if action is not None:
-                preview = getattr(robot, "publish_action_preview", None)
-                if callable(preview):
-                    try:
-                        preview(action, action_keys)
-                    except Exception as e:
-                        logger.warning("failed to publish action preview: %s", e)
-                if publish_to_robot:
-                    try:
-                        robot.publish_action(action, action_keys)
-                    except Exception as e:
-                        logger.error("failed to publish robot action: %s", e)
-            elif publish_to_robot:
-                idle = getattr(robot, "publish_idle_action", None)
-                if callable(idle):
-                    try:
-                        idle(action_keys)
-                    except Exception as e:
-                        logger.error("failed to publish idle robot action: %s", e)
+            if self._chunk_ack_active_locked():
+                self._consume_action_step_ack_locked(robot)
+                self._warn_if_action_chunk_timed_out_locked()
+            else:
+                action = processor.pop_action()
+                if action is not None:
+                    preview = getattr(robot, "publish_action_preview", None)
+                    if callable(preview):
+                        try:
+                            preview(action, action_keys)
+                        except Exception as e:
+                            logger.warning("failed to publish action preview: %s", e)
+                    if publish_to_robot:
+                        try:
+                            robot.publish_action(action, action_keys)
+                        except Exception as e:
+                            logger.error("failed to publish robot action: %s", e)
+                elif publish_to_robot:
+                    idle = getattr(robot, "publish_idle_action", None)
+                    if callable(idle):
+                        try:
+                            idle(action_keys)
+                        except Exception as e:
+                            logger.error("failed to publish idle robot action: %s", e)
 
             should_request = self._should_request_actions(processor)
 
@@ -304,7 +366,53 @@ class ControlLoop:
                 generation == self._generation
                 and self._running
                 and self._processor is not None
+                and self._robot is not None
             ):
+                if self._chunk_ack_active_locked():
+                    if self._awaiting_chunk_seq_id is not None:
+                        logger.warning(
+                            "discarding action response while chunk %d still awaits ACK",
+                            self._awaiting_chunk_seq_id,
+                        )
+                        return
+                    if (
+                        self._target_chunk_size is not None
+                        and response.chunk_size != self._target_chunk_size
+                    ):
+                        logger.warning(
+                            "chunk_ack requires exactly %d actions, got %d",
+                            self._target_chunk_size,
+                            response.chunk_size,
+                        )
+                        return
+                    seq_id = self._next_chunk_seq_id
+                    self._next_chunk_seq_id += 1
+                    self._awaiting_chunk_seq_id = seq_id
+                    self._awaiting_chunk_size = int(response.chunk_size)
+                    self._awaiting_chunk_started_at = time.monotonic()
+                    self._acked_chunk_steps = 0
+                    self._last_action_step_ack_token = None
+                    self._action_chunk_timeout_warned = False
+                    try:
+                        self._robot.publish_action_chunk(
+                            chunk,
+                            session_id=self._chunk_session_id,
+                            seq_id=seq_id,
+                        )
+                    except Exception as e:
+                        logger.error("failed to publish action chunk: %s", e)
+                        self._clear_awaiting_chunk_locked()
+                        return
+                    logger.info(
+                        "published action chunk: session=%d seq=%d shape=%dx%d; "
+                        "waiting for environment completion ACK",
+                        self._chunk_session_id,
+                        seq_id,
+                        response.chunk_size,
+                        response.action_dim,
+                    )
+                    return
+
                 buffer_delay_s = self._processor.buffer_size / max(
                     1.0,
                     self._processor.output_hz,
@@ -339,9 +447,144 @@ class ControlLoop:
     def _should_request_actions(self, processor: ActionChunkProcessor) -> bool:
         if self._request_thread is not None and self._request_thread.is_alive():
             return False
+        if self._chunk_ack_active_locked():
+            return self._awaiting_chunk_seq_id is None
         if self._action_request_mode == ACTION_REQUEST_MODE_SYNC:
             return processor.buffer_size <= 0
         return processor.buffer_size < self._refill_threshold(processor)
+
+    def _chunk_ack_active_locked(self) -> bool:
+        return (
+            self._action_execution_mode == ACTION_EXECUTION_MODE_CHUNK_ACK
+            and self._publish_to_robot
+        )
+
+    def _consume_action_step_ack_locked(self, robot: RobotClient) -> None:
+        getter = getattr(robot, "get_latest_action_step_ack", None)
+        if not callable(getter):
+            return
+        try:
+            ack = getter()
+        except Exception as e:
+            logger.warning("failed to read action step ACK: %s", e)
+            return
+        if ack is None:
+            return
+
+        def value(name: str, default=0):
+            if isinstance(ack, dict):
+                return ack.get(name, default)
+            return getattr(ack, name, default)
+
+        token = (
+            int(value("session_id")),
+            int(value("seq_id")),
+            int(value("action_index", -1)),
+            int(value("executed_steps")),
+            int(value("status", -1)),
+            float(value("timestamp", 0.0)),
+        )
+        if token == self._last_action_step_ack_token:
+            return
+        self._last_action_step_ack_token = token
+        if self._awaiting_chunk_seq_id is None:
+            return
+        if (
+            token[0] != self._chunk_session_id
+            or token[1] != self._awaiting_chunk_seq_id
+        ):
+            return
+
+        action_index = token[2]
+        executed_steps = token[3]
+        status = token[4]
+        ack_chunk_size = int(value("chunk_size"))
+        if status == ACTION_STEP_ACK_EXECUTED:
+            if (
+                0 <= action_index < self._awaiting_chunk_size
+                and executed_steps == action_index + 1
+            ):
+                self._acked_chunk_steps = max(
+                    self._acked_chunk_steps,
+                    executed_steps,
+                )
+            return
+        if status == ACTION_STEP_ACK_COMPLETED:
+            if (
+                ack_chunk_size != self._awaiting_chunk_size
+                or executed_steps != self._awaiting_chunk_size
+                or action_index != self._awaiting_chunk_size - 1
+            ):
+                logger.warning(
+                    "ignoring malformed completed ACK for seq=%d: "
+                    "index=%d executed=%d chunk_size=%d expected=%d",
+                    self._awaiting_chunk_seq_id,
+                    action_index,
+                    executed_steps,
+                    ack_chunk_size,
+                    self._awaiting_chunk_size,
+                )
+                return
+            logger.info(
+                "environment completed action chunk: session=%d seq=%d steps=%d",
+                self._chunk_session_id,
+                self._awaiting_chunk_seq_id,
+                executed_steps,
+            )
+            self._clear_awaiting_chunk_locked()
+            return
+        if status == ACTION_STEP_ACK_CANCELLED:
+            logger.info(
+                "environment cancelled action chunk: session=%d seq=%d "
+                "executed=%d/%d",
+                self._chunk_session_id,
+                self._awaiting_chunk_seq_id,
+                executed_steps,
+                self._awaiting_chunk_size,
+            )
+            self._clear_awaiting_chunk_locked()
+
+    def _warn_if_action_chunk_timed_out_locked(self) -> None:
+        if (
+            self._awaiting_chunk_seq_id is None
+            or self._awaiting_chunk_started_at is None
+            or self._action_chunk_ack_timeout_s <= 0.0
+            or self._action_chunk_timeout_warned
+        ):
+            return
+        elapsed_s = time.monotonic() - self._awaiting_chunk_started_at
+        if elapsed_s < self._action_chunk_ack_timeout_s:
+            return
+        self._action_chunk_timeout_warned = True
+        logger.warning(
+            "action chunk ACK timeout: session=%d seq=%d acked=%d/%d "
+            "elapsed=%.1fs; not republishing to avoid duplicate execution",
+            self._chunk_session_id,
+            self._awaiting_chunk_seq_id,
+            self._acked_chunk_steps,
+            self._awaiting_chunk_size,
+            elapsed_s,
+        )
+
+    def _cancel_awaiting_chunk_locked(self) -> None:
+        if self._awaiting_chunk_seq_id is None:
+            return
+        if self._robot is not None:
+            cancel = getattr(self._robot, "cancel_action_chunk", None)
+            if callable(cancel):
+                try:
+                    cancel(self._chunk_session_id, self._awaiting_chunk_seq_id)
+                except Exception as e:
+                    logger.warning("failed to cancel external action chunk: %s", e)
+        self._clear_awaiting_chunk_locked()
+
+    def _clear_awaiting_chunk_locked(self) -> None:
+        self._awaiting_chunk_seq_id = None
+        self._awaiting_chunk_size = 0
+        self._awaiting_chunk_started_at = None
+        self._acked_chunk_steps = 0
+        self._last_action_step_ack_token = None
+        self._action_chunk_timeout_warned = False
 
     def _refill_threshold(self, processor: ActionChunkProcessor) -> int:
         threshold_s = max(0.0, self._refill_margin_s)

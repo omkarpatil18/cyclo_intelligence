@@ -23,6 +23,11 @@ bool include_robotis_license
 # detection) for backward compatibility with old UI builds.
 string service_type
 
+# Policy family within the inference backend ("act" / "smolvla" /
+# "n17" / ...).  Kept separate from service_type because multiple policies
+# share the LeRobot backend but have different language/recording semantics.
+string policy_type
+
 # Inference output mode. "simulation" runs policy inference and publishes
 # preview-only trajectories for the 3D viewer. "robot" permits the policy
 # container Main runtime to publish robot command topics.

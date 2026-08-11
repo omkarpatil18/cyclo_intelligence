@@ -129,6 +129,14 @@ def _service_type_from_model(model: str) -> str:
     return value
 
 
+def _policy_type_from_model(model: str) -> str:
+    """Extract the policy family from a UI/BT model selection."""
+    value = (model or '').strip().lower()
+    if ':' in value:
+        return value.split(':', 1)[1].strip()
+    return value
+
+
 def _normalize_action_request_mode(value: str) -> str:
     mode = str(value or '').strip().lower()
     if mode == 'sync':
@@ -432,6 +440,7 @@ class SendCommand(BaseAction):
         ti.task_type = 'inference'
         ti.policy_path = self.policy_path
         ti.service_type = _service_type_from_model(self.model)
+        ti.policy_type = _policy_type_from_model(self.model)
         if self.command_str == 'LOAD' and hasattr(ti, 'inference_mode'):
             ti.inference_mode = self.inference_mode
         if self.command_str == 'LOAD' and hasattr(ti, 'action_request_mode'):

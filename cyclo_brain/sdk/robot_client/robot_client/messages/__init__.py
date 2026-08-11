@@ -150,11 +150,27 @@ float64 timestamp
 """
 
 # --- ActionChunk (interfaces/msg/ActionChunk.msg) ---
-# Legacy/optional chunk-shaped payload. The current Main <-> Engine path uses
-# interfaces/srv/EngineCommand.action_list.
+ACTION_CHUNK_TOPIC = "/inference/action_chunk"
 ACTION_CHUNK_DEF = """\
+uint64 session_id
 uint64 seq_id
 int32 chunk_size
 int32 action_dim
 float64[] data
+"""
+
+# --- ActionStepAck (interfaces/msg/ActionStepAck.msg) ---
+ACTION_STEP_ACK_TOPIC = "/inference/action_step_ack"
+ACTION_STEP_ACK_DEF = """\
+uint8 STATUS_EXECUTED = 0
+uint8 STATUS_COMPLETED = 1
+uint8 STATUS_CANCELLED = 2
+uint64 session_id
+uint64 seq_id
+int32 action_index
+int32 executed_steps
+int32 chunk_size
+uint8 status
+float64[] executed_action
+float64 timestamp
 """

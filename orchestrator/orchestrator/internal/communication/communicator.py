@@ -97,6 +97,10 @@ class Communicator:
             robot_schema.get_camera_info_topics(robot_section)
         )
         self._mcap_topics = robot_schema.get_mcap_record_topics(robot_section)
+        self._inference_mcap_topics = robot_schema.get_mcap_record_topics(
+            robot_section,
+            inference=True,
+        )
 
         # Initialize DataEditor for dataset editing
         self.data_editor = DataEditor()
@@ -108,6 +112,9 @@ class Communicator:
         node.get_logger().info(f'Camera info topics: {self.camera_info_topics}')
         node.get_logger().info(f'Rosbag extra topics: {self.rosbag_extra_topics}')
         node.get_logger().info(f'MCAP topics (v2): {self._mcap_topics}')
+        node.get_logger().info(
+            f'Inference MCAP topics (v2): {self._inference_mcap_topics}'
+        )
 
         self.heartbeat_qos_profile = QoSProfile(
             depth=1,
@@ -134,9 +141,10 @@ class Communicator:
         self.init_publishers()
         self.init_services()
 
-    def get_mcap_topics(self):
-        """Topics to record in the per-episode MCAP (no images / camera_info)."""
-        return list(self._mcap_topics)
+    def get_mcap_topics(self, inference: bool = False):
+        """Topics for the normal or inference per-episode MCAP inventory."""
+        source = self._inference_mcap_topics if inference else self._mcap_topics
+        return list(source)
 
     def get_video_topics(self) -> Dict[str, str]:
         """``{cam_name: image_topic}`` — destinations for the MP4 recorder."""

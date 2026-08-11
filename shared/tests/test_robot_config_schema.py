@@ -152,6 +152,66 @@ def test_tactile_is_optional_for_existing_sg2_config():
     assert "/right_hand/finger_pressures" not in robot_schema.get_mcap_record_topics(section)
 
 
+def test_sg2_uses_three_camera_act_layout_without_right_head():
+    section = robot_schema.load_robot_section("ffw_sg2_rev1")
+
+    expected_cameras = [
+        "cam_left_head",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    ]
+    assert list(robot_schema.get_image_topics(section)) == expected_cameras
+    assert list(robot_schema.get_camera_info_topics(section)) == expected_cameras
+
+    extra_topics = robot_schema.get_recording_extra_topics(section)
+    assert "/zed/zed_node/right/camera_info" not in extra_topics
+
+
+def test_sg2_inference_topics_are_opt_in_to_mcap_inventory():
+    section = robot_schema.load_robot_section("ffw_sg2_rev1")
+
+    normal_topics = robot_schema.get_mcap_record_topics(section)
+    inference_topics = robot_schema.get_mcap_record_topics(
+        section,
+        inference=True,
+    )
+
+    assert "/inference/action_chunk" not in normal_topics
+    assert "/inference/action_step_ack" not in normal_topics
+    assert inference_topics == normal_topics + [
+        "/inference/action_chunk",
+        "/inference/action_step_ack",
+    ]
+
+
+def test_inference_mcap_inventory_deduplicates_common_topics_in_schema_order():
+    section = {
+        "observation": {
+            "state": {
+                "robot": {
+                    "topic": "/joint_states",
+                    "msg_type": "sensor_msgs/msg/JointState",
+                    "joint_names": ["joint_a"],
+                },
+            },
+        },
+        "recording": {
+            "extra_topics": ["/tf", "/inference/action_chunk"],
+            "inference_extra_topics": [
+                "/inference/action_chunk",
+                "/inference/action_step_ack",
+            ],
+        },
+    }
+
+    assert robot_schema.get_mcap_record_topics(section, inference=True) == [
+        "/joint_states",
+        "/tf",
+        "/inference/action_chunk",
+        "/inference/action_step_ack",
+    ]
+
+
 def test_malformed_topic_entries_are_ignored():
     section = {
         "observation": {

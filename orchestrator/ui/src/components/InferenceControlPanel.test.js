@@ -5,7 +5,7 @@ import toast from 'react-hot-toast';
 import InferenceControlPanel from './InferenceControlPanel';
 import taskReducer, { setInferenceStatus } from '../features/tasks/taskSlice';
 import rosReducer from '../features/ros/rosSlice';
-import { InferencePhase } from '../constants/taskPhases';
+import { InferencePhase, RecordPhase } from '../constants/taskPhases';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
 
 jest.mock('react-hot-toast', () => {
@@ -41,6 +41,7 @@ const renderPanel = ({
   inferenceMode = 'robot',
   inferencePhase = InferencePhase.READY,
   taskOverrides = {},
+  recordStatusOverrides = {},
   sendRecordCommand: sendOverride = null,
 } = {}) => {
   const sendRecordCommand = sendOverride || jest.fn().mockResolvedValue({
@@ -81,6 +82,10 @@ const renderPanel = ({
         inferenceStatus: {
           ...initialTasks.inferenceStatus,
           inferencePhase,
+        },
+        recordStatus: {
+          ...initialTasks.recordStatus,
+          ...recordStatusOverrides,
         },
       },
       ros: {
@@ -192,6 +197,55 @@ describe('InferenceControlPanel deploy safety', () => {
     await waitFor(() => {
       expect(sendRecordCommand).not.toHaveBeenCalled();
     });
+  });
+
+  test('blocks Clear while an inference recording still needs a label', async () => {
+    const { sendRecordCommand } = renderPanel({
+      inferenceMode: 'simulation',
+      inferencePhase: InferencePhase.INFERENCING,
+      recordStatusOverrides: {
+        taskType: 'inference',
+        recordPhase: RecordPhase.RECORDING,
+        running: true,
+      },
+    });
+
+    const clearButton = screen.getByRole('button', {
+      name: /save the recording with success or fail first/i,
+    });
+    expect(clearButton).toBeDisabled();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.keyUp(window, { key: 'Escape' });
+
+    await waitFor(() => {
+      expect(sendRecordCommand).not.toHaveBeenCalledWith('finish');
+    });
+  });
+
+  test('preserves INFERENCING when atomic Clear is rejected by the backend', async () => {
+    const sendRecordCommand = jest.fn().mockResolvedValue({
+      success: false,
+      message: 'Active inference recording must be saved with Success or Fail',
+    });
+    const { store } = renderPanel({
+      inferenceMode: 'simulation',
+      inferencePhase: InferencePhase.INFERENCING,
+      sendRecordCommand,
+    });
+
+    fireEvent.click(screen.getByRole('button', {
+      name: /stop inference and unload model/i,
+    }));
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(
+        'Command failed: Active inference recording must be saved with Success or Fail'
+      );
+    });
+    expect(store.getState().tasks.inferenceStatus.inferencePhase).toBe(
+      InferencePhase.INFERENCING
+    );
   });
 
   test('requires shared task instruction for language-conditioned inference', async () => {

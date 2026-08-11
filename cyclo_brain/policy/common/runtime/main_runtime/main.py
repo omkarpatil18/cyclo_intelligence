@@ -99,6 +99,10 @@ class MainRuntime:
                 "REFILL_LATENCY_SAMPLE_MAX_S", "2.0"
             ),
             action_request_mode=os.environ.get("ACTION_REQUEST_MODE", "async"),
+            action_execution_mode=os.environ.get("ACTION_EXECUTION_MODE", "row"),
+            action_chunk_ack_timeout_s=float(
+                os.environ.get("ACTION_CHUNK_ACK_TIMEOUT_S", "30.0")
+            ),
         )
         self._engine_client = engine_client
         self._command_srv = None

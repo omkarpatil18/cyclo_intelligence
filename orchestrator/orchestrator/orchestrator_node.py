@@ -55,13 +55,10 @@ from interfaces.srv import (
 )
 
 from orchestrator.internal.communication.communicator import Communicator
-from orchestrator.internal.communication.cyclo_data_client import CycloDataClient
-# DataManager is imported only for its whoami_huggingface @staticmethod
-# used by set_hf_user / get_hf_user callbacks. Session-state ownership
-# lives in cyclo_data.RecordingService (Step 3 Part C2d).
-# TODO(post-C2d): relocate whoami_huggingface to cyclo_data.hub and drop
-# this import.
-from cyclo_data.recorder.session_manager import DataManager
+from orchestrator.internal.communication.cyclo_data_client import (
+    CallResult,
+    CycloDataClient,
+)
 from cyclo_data.hub.endpoint_store import HFEndpointStore
 from cyclo_data.recorder.replay_handler import ReplayDataHandler
 from orchestrator.internal.communication.container_service_client import (
@@ -69,6 +66,13 @@ from orchestrator.internal.communication.container_service_client import (
 )
 from orchestrator.internal.communication.inference_mode import (
     publish_to_robot_from_task_info,
+)
+from orchestrator.internal.communication.inference_collection import (
+    make_inference_collection_id,
+    resolve_inference_policy_type,
+)
+from orchestrator.internal.communication.recording_outcome import (
+    forward_inference_record_stop,
 )
 from orchestrator.timer.timer_manager import TimerManager
 from orchestrator.training.zenoh_training_manager import ZenohTrainingManager
@@ -152,6 +156,12 @@ class OrchestratorNode(Node):
         self.robot_type = ''
         self.on_recording = False
         self.on_inference = False
+        # Stable for one successfully-started inference lifecycle. It is
+        # created only when the policy reaches INFERENCING, survives
+        # PAUSE/RESUME, and is cleared together with the policy client.
+        self._inference_record_collection_id = ''
+        self._inference_session_closing = False
+        self._inference_reconfiguration_in_progress = False
 
         self.robot_type_list = self.get_robot_type_list()
         self.start_recording_time: float = 0.0
@@ -260,18 +270,110 @@ class OrchestratorNode(Node):
         with self._state_lock:
             return self.on_recording, self.on_inference
 
-    def _set_session_active(self, *, on_recording=None, on_inference=None,
-                             start_time=None):
-        """Atomic write of any subset of (on_recording, on_inference,
-        start_recording_time) under _state_lock. ``None`` means leave alone.
-        """
+    def _snapshot_trigger_session_state(self):
+        """Snapshot trigger routing plus the inference collection identity."""
         with self._state_lock:
-            if on_recording is not None:
-                self.on_recording = on_recording
-            if on_inference is not None:
-                self.on_inference = on_inference
-            if start_time is not None:
-                self.start_recording_time = start_time
+            return (
+                self.on_recording,
+                self.on_inference,
+                self._inference_record_collection_id,
+            )
+
+    def _begin_inference_reconfiguration(self) -> bool:
+        """Atomically exclude recording START while policy state changes."""
+        with self._recording_command_lock:
+            with self._state_lock:
+                if (
+                    self.on_recording
+                    or self._inference_reconfiguration_in_progress
+                ):
+                    return False
+                self._inference_reconfiguration_in_progress = True
+                return True
+
+    def _end_inference_reconfiguration(self) -> None:
+        with self._recording_command_lock:
+            with self._state_lock:
+                self._inference_reconfiguration_in_progress = False
+
+    def _activate_inference_session(self, client, task_info) -> bool:
+        """Atomically mark inference active and ensure its collection ID."""
+        with self._state_lock:
+            if (
+                self.container_service_client is not client
+                or self._inference_session_closing
+            ):
+                return False
+            if not self._inference_record_collection_id:
+                self._inference_record_collection_id = (
+                    make_inference_collection_id(
+                        self._effective_inference_policy_type(task_info)
+                    )
+                )
+                self.get_logger().info(
+                    'Inference recording collection created: '
+                    f'{self._inference_record_collection_id}'
+                )
+            self.on_inference = True
+            self.start_recording_time = time.perf_counter()
+            return True
+
+    def _publish_inference_phase_if_current(
+        self,
+        client,
+        phase: int,
+        error: str = '',
+    ) -> bool:
+        """Publish only while ``client`` still owns the active lifecycle."""
+        with self._state_lock:
+            if (
+                self.container_service_client is not client
+                or not self.on_inference
+                or self._inference_session_closing
+            ):
+                return False
+            # This is a one-shot publisher, not a service call. Keeping it in
+            # the state transition prevents READY -> stale INFERENCING races.
+            self._publish_inference_phase(phase, error=error)
+            return True
+
+    def _restore_inference_session_after_failed_close(self) -> None:
+        """Re-open lifecycle commands when a requested close did not persist."""
+        with self._state_lock:
+            self._inference_session_closing = False
+
+    @staticmethod
+    def _is_inference_task_info(task_info) -> bool:
+        if task_info is None:
+            return False
+        return (
+            str(getattr(task_info, 'task_type', '') or '') == 'inference'
+            or bool(getattr(task_info, 'record_inference_mode', False))
+        )
+
+    @staticmethod
+    def _effective_inference_policy_type(task_info) -> str:
+        if task_info is None:
+            return ''
+        return resolve_inference_policy_type(
+            getattr(task_info, 'policy_type', ''),
+            service_type=getattr(task_info, 'service_type', ''),
+            policy_path=getattr(task_info, 'policy_path', ''),
+        )
+
+    def _inference_collection_id_for_task(self, task_info) -> str:
+        if task_info is None:
+            return ''
+        if not self._is_inference_task_info(task_info):
+            return ''
+        with self._state_lock:
+            if (
+                not self.on_inference
+                or self.container_service_client is None
+                or self._inference_session_closing
+            ):
+                return ''
+            return self._inference_record_collection_id
 
     def _apply_cyclo_data_response(self, cd_result, response) -> None:
         """Mirror a CycloDataClient CallResult onto a SendCommand.Response.
@@ -293,17 +395,61 @@ class OrchestratorNode(Node):
             response.success = False
             response.message = cd_result.message or 'cyclo_data call failed'
 
+    @staticmethod
+    def _cyclo_data_command_succeeded(cd_result) -> bool:
+        return bool(
+            cd_result is not None
+            and cd_result.success
+            and cd_result.response is not None
+            and cd_result.response.success
+        )
+
+    def _commit_recording_command_state(self, command: int, cd_result) -> None:
+        """Commit recorder state while the recording command lock is held."""
+        if not self._cyclo_data_command_succeeded(cd_result):
+            return
+        starts_recording = command in {
+            RecordingCommand.Request.START,
+            RecordingCommand.Request.START_SEGMENT,
+        }
+        stops_recording = command in {
+            RecordingCommand.Request.STOP,
+            RecordingCommand.Request.FINISH,
+            RecordingCommand.Request.MOVE_TO_NEXT,
+            RecordingCommand.Request.RERECORD,
+            RecordingCommand.Request.SKIP_TASK,
+            RecordingCommand.Request.CANCEL,
+            RecordingCommand.Request.STOP_SEGMENT,
+            RecordingCommand.Request.CANCEL_SEGMENT,
+            RecordingCommand.Request.FINISH_EPISODE,
+            RecordingCommand.Request.DISCARD_EPISODE,
+        }
+        if not starts_recording and not stops_recording:
+            return
+        with self._state_lock:
+            self.on_recording = starts_recording
+            if starts_recording:
+                self.start_recording_time = time.perf_counter()
+
     def _forward_recording(self, command: int, task_info=None,
                            include_topics: bool = False,
-                           segment_index: int = 0):
+                           segment_index: int = 0,
+                           episode_outcome: int = 0,
+                           close_inference_session: bool = False,
+                           expected_collection_id: Optional[str] = None):
         """DRY helper for every recording forwarder site.
 
         Populates topics + urdf_path from orchestrator-owned state
         (Communicator's topic inventory, `self.params['urdf_path']`) so
         call sites stay one-liners.
         """
+        forwarded_task_info = (
+            task_info if task_info is not None
+            else self._last_ui_task_info
+        )
+        is_inference = self._is_inference_task_info(forwarded_task_info)
         topics = (
-            self.communicator.get_mcap_topics()
+            self.communicator.get_mcap_topics(inference=is_inference)
             if include_topics and self.communicator is not None
             else []
         )
@@ -319,19 +465,77 @@ class OrchestratorNode(Node):
             RecordingCommand.Request.RERECORD,
             RecordingCommand.Request.DISCARD_EPISODE,
         } else 5.0
-        with self._recording_command_lock:
-            return self._cyclo_data.send_recording_command(
-                command=command,
-                task_info=(
-                    task_info if task_info is not None
-                    else self._last_ui_task_info
-                ),
-                robot_type=getattr(self, 'robot_type', ''),
-                topics=topics,
-                urdf_path=urdf_path,
-                segment_index=segment_index,
-                timeout_sec=timeout_sec,
+        if is_inference:
+            # Recording provenance may need a concrete family for legacy
+            # callers. Work on a copy so policy language/model inputs remain
+            # byte-for-byte unchanged.
+            forwarded_task_info = self._copy_task_info(forwarded_task_info)
+            forwarded_task_info.policy_type = (
+                self._effective_inference_policy_type(forwarded_task_info)
             )
+
+        # Lock order is always recording_command_lock -> state_lock. Teardown
+        # uses the same order, so a joystick START is either completed before
+        # the terminating FINISH or rejected after lifecycle closing begins.
+        with self._recording_command_lock:
+            with self._state_lock:
+                if (
+                    close_inference_session
+                    and is_inference
+                    and command == RecordingCommand.Request.FINISH
+                    and self.on_recording
+                    and episode_outcome == (
+                        RecordingCommand.Request.EPISODE_OUTCOME_UNSPECIFIED
+                    )
+                ):
+                    return CallResult(
+                        success=False,
+                        message=(
+                            'Active inference recording must be saved with '
+                            'Success or Fail before clearing inference'
+                        ),
+                    )
+                if close_inference_session:
+                    self._inference_session_closing = True
+                collection_id = (
+                    self._inference_record_collection_id
+                    if is_inference else ''
+                )
+                if (
+                    is_inference
+                    and expected_collection_id is not None
+                    and collection_id != expected_collection_id
+                ):
+                    collection_id = ''
+                if command == RecordingCommand.Request.START and (
+                    not self.on_inference
+                    or self.container_service_client is None
+                    or self._inference_session_closing
+                    or getattr(
+                        self,
+                        '_inference_reconfiguration_in_progress',
+                        False,
+                    )
+                ):
+                    collection_id = ''
+            try:
+                cd_result = self._cyclo_data.send_recording_command(
+                    command=command,
+                    task_info=forwarded_task_info,
+                    robot_type=getattr(self, 'robot_type', ''),
+                    topics=topics,
+                    urdf_path=urdf_path,
+                    segment_index=segment_index,
+                    episode_outcome=episode_outcome,
+                    collection_id=collection_id,
+                    timeout_sec=timeout_sec,
+                )
+                self._commit_recording_command_state(command, cd_result)
+                return cd_result
+            except Exception:
+                if close_inference_session:
+                    self._restore_inference_session_after_failed_close()
+                raise
 
     @staticmethod
     def _task_info_record_signature(task_info: Optional[TaskInfo]):
@@ -396,6 +600,7 @@ class OrchestratorNode(Node):
             'chunk_align_window_s',
             'include_robotis_license',
             'service_type',
+            'policy_type',
             'inference_mode',
             'action_request_mode',
             'acceleration_mode',
@@ -453,16 +658,16 @@ class OrchestratorNode(Node):
         return next(iter(robot_types.keys())), ''
 
     def _get_inference_record_task_info(self) -> Optional[TaskInfo]:
-        task_info = self._prepared_inference_task_info
-        if task_info is None:
-            task_info = self._last_ui_task_info
-        if task_info is None:
+        source_task_info = self._prepared_inference_task_info
+        if source_task_info is None:
+            source_task_info = self._last_ui_task_info
+        if source_task_info is None:
             return None
-        if getattr(task_info, 'task_type', '') != 'inference':
-            task_info = self._copy_task_info(task_info)
-            task_info.task_type = 'inference'
-            task_info.subtask_instruction = []
+        task_info = self._copy_task_info(source_task_info)
+        task_info.task_type = 'inference'
+        task_info.subtask_instruction = []
         task_info.record_inference_mode = True
+        task_info.policy_type = self._effective_inference_policy_type(task_info)
         self._prepared_inference_task_info = task_info
         self._last_ui_task_info = task_info
         return task_info
@@ -726,6 +931,9 @@ class OrchestratorNode(Node):
         )
 
         try:
+            # Lazy import keeps the orchestrator lifecycle module independent
+            # from the converter/torch stack during startup and unit tests.
+            from cyclo_data.recorder.session_manager import DataManager
             user_ids = DataManager.whoami_huggingface(endpoint, token)
             if not user_ids:
                 response.user_id_list = []
@@ -772,6 +980,7 @@ class OrchestratorNode(Node):
                 )
                 return response
 
+            from cyclo_data.recorder.session_manager import DataManager
             user_ids = DataManager.whoami_huggingface(entry.endpoint, entry.token)
             if not user_ids:
                 response.user_id_list = []
@@ -1095,6 +1304,7 @@ class OrchestratorNode(Node):
         - STOP / FINISH: Stop and save recording
         - RERECORD: Cancel current recording (discard)
         """
+        inference_reconfiguration_owned_by_worker = False
         try:
             if request.command == SendCommand.Request.REFRESH_TOPICS:
                 # Forward to cyclo_data /data/recording with the topic
@@ -1194,10 +1404,6 @@ class OrchestratorNode(Node):
                 if (cd_result.success
                         and cd_result.response is not None
                         and cd_result.response.success):
-                    self._set_session_active(
-                        on_recording=True,
-                        start_time=time.perf_counter(),
-                    )
                     response.success = True
                     response.message = cd_result.response.message or 'Recording started'
                 else:
@@ -1232,10 +1438,6 @@ class OrchestratorNode(Node):
                         and cd_result.response is not None
                         and cd_result.response.success):
                     self._trigger_record_active_segment_index = int(request.segment_index)
-                    self._set_session_active(
-                        on_recording=True,
-                        start_time=time.perf_counter(),
-                    )
                     response.success = True
                     response.message = cd_result.response.message or 'Segment started'
                 else:
@@ -1266,7 +1468,6 @@ class OrchestratorNode(Node):
                 if (cd_result.success
                         and cd_result.response is not None
                         and cd_result.response.success):
-                    self._set_session_active(on_recording=False)
                     if request.command == SendCommand.Request.STOP_SEGMENT:
                         self._advance_trigger_record_cursor_after_save(
                             int(request.segment_index)
@@ -1300,7 +1501,6 @@ class OrchestratorNode(Node):
                         self._trigger_record_active_segment_index = 0
                         self._trigger_record_next_segment_index = 0
                     elif request.command == SendCommand.Request.DISCARD_EPISODE:
-                        self._set_session_active(on_recording=False)
                         self._trigger_record_active_segment_index = 0
                         self._trigger_record_next_segment_index = 0
                     elif request.command == SendCommand.Request.DISCARD_SEGMENT:
@@ -1308,6 +1508,13 @@ class OrchestratorNode(Node):
                 self._apply_cyclo_data_response(cd_result, response)
 
             elif request.command == SendCommand.Request.START_INFERENCE:
+                if not self._begin_inference_reconfiguration():
+                    response.success = False
+                    response.message = (
+                        'Save the active inference recording with Success or '
+                        'Fail before reloading or resuming inference'
+                    )
+                    return response
                 task_info = request.task_info
                 self._cache_ui_task_info(task_info, 'START_INFERENCE')
 
@@ -1391,17 +1598,32 @@ class OrchestratorNode(Node):
                                 self._loaded_inference_publish_to_robot = (
                                     publish_to_robot
                                 )
-                            self._set_session_active(
-                                on_inference=True,
-                                start_time=time.perf_counter(),
+                            inference_activated = (
+                                self._activate_inference_session(
+                                    existing_client, task_info
+                                )
                             )
-                            self._publish_inference_phase(
-                                InferenceStatus.INFERENCING)
-                            response.success = True
-                            response.message = (
-                                'Inference resumed (model already loaded)'
-                            )
-                            start_handled = True
+                            if not inference_activated:
+                                response.success = False
+                                response.message = (
+                                    'Inference session changed during resume'
+                                )
+                                start_handled = True
+                            elif not self._publish_inference_phase_if_current(
+                                existing_client,
+                                InferenceStatus.INFERENCING,
+                            ):
+                                response.success = False
+                                response.message = (
+                                    'Inference session changed during resume'
+                                )
+                                start_handled = True
+                            else:
+                                response.success = True
+                                response.message = (
+                                    'Inference resumed (model already loaded)'
+                                )
+                                start_handled = True
                         else:
                             resume_message = resume_result.message or ''
                             if resume_message in ('not running', 'LOAD first'):
@@ -1512,13 +1734,14 @@ class OrchestratorNode(Node):
                                     self.get_logger().error(
                                         f'Async LOAD failed: {load_result.message}'
                                     )
-                                    self._teardown_inference_client(
+                                    detached = self._teardown_inference_client(
                                         expected_client=client
                                     )
-                                    self._publish_inference_phase(
-                                        InferenceStatus.READY,
-                                        error=load_result.message,
-                                    )
+                                    if detached:
+                                        self._publish_inference_phase(
+                                            InferenceStatus.READY,
+                                            error=load_result.message,
+                                        )
                                     return
 
                                 with self._state_lock:
@@ -1538,13 +1761,14 @@ class OrchestratorNode(Node):
                                     self.get_logger().error(
                                         f'Async START failed: {start_result.message}'
                                     )
-                                    self._teardown_inference_client(
+                                    detached = self._teardown_inference_client(
                                         expected_client=client
                                     )
-                                    self._publish_inference_phase(
-                                        InferenceStatus.READY,
-                                        error=start_result.message,
-                                    )
+                                    if detached:
+                                        self._publish_inference_phase(
+                                            InferenceStatus.READY,
+                                            error=start_result.message,
+                                        )
                                     return
 
                                 with self._state_lock:
@@ -1567,38 +1791,54 @@ class OrchestratorNode(Node):
                                         requested_action_request_mode
                                     )
 
-                                self._set_session_active(
-                                    on_inference=True,
-                                    start_time=time.perf_counter(),
-                                )
-                                self._publish_inference_phase(
-                                    InferenceStatus.INFERENCING
+                                if not self._activate_inference_session(
+                                    client, task_info
+                                ):
+                                    return
+                                self._publish_inference_phase_if_current(
+                                    client,
+                                    InferenceStatus.INFERENCING,
                                 )
                         except Exception as e:
                             self.get_logger().error(
                                 f'Async LOAD/START error: {e}', exc_info=True
                             )
                             try:
-                                self._teardown_inference_client(
+                                detached = self._teardown_inference_client(
                                     expected_client=client
                                 )
-                                self._publish_inference_phase(
-                                    InferenceStatus.READY, error=str(e)
-                                )
+                                if detached:
+                                    self._publish_inference_phase(
+                                        InferenceStatus.READY, error=str(e)
+                                    )
                             except Exception:
                                 pass
 
+                    def _load_and_start_with_reconfiguration_release():
+                        try:
+                            _load_and_start()
+                        finally:
+                            # START_INFERENCE returned as soon as the worker
+                            # was launched, but recording/redeploy exclusion
+                            # must cover the full asynchronous LOAD -> START
+                            # lifecycle rather than only thread creation.
+                            self._end_inference_reconfiguration()
+
                     threading.Thread(
-                        target=_load_and_start,
+                        target=_load_and_start_with_reconfiguration_release,
                         daemon=True,
                         name=f'inference-load-{service_prefix.strip("/")}',
                     ).start()
+                    inference_reconfiguration_owned_by_worker = True
 
                     response.success = True
                     response.message = (
                         f'{service_prefix.strip("/").upper()} inference loading '
                         f'({"robot" if publish_to_robot else "simulation"} mode)'
                     )
+
+                if not inference_reconfiguration_owned_by_worker:
+                    self._end_inference_reconfiguration()
 
             elif request.command == SendCommand.Request.CONVERT_MP4:
                 # CONVERT_MP4 path resolution stays orchestrator-side
@@ -1813,15 +2053,14 @@ class OrchestratorNode(Node):
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.RERECORD,
                             task_info=request.task_info,
+                            close_inference_session=snapshot_on_inference,
                         )
                         if (cd_result.success
                                 and cd_result.response is not None
                                 and cd_result.response.success):
                             # Inference teardown stays orchestrator-side.
-                            self._teardown_inference_client()
-                            self._set_session_active(
-                                on_recording=False, on_inference=False,
-                            )
+                            if snapshot_on_inference:
+                                self._teardown_inference_client()
                             if self.timer_manager:
                                 self.timer_manager.stop(timer_name='collection')
                             response.success = True
@@ -1829,6 +2068,8 @@ class OrchestratorNode(Node):
                                 cd_result.response.message or 'Recording cancelled'
                             )
                         else:
+                            if snapshot_on_inference:
+                                self._restore_inference_session_after_failed_close()
                             self._apply_cyclo_data_response(cd_result, response)
 
                     elif request.command == SendCommand.Request.STOP_INFERENCE:
@@ -1864,8 +2105,22 @@ class OrchestratorNode(Node):
                                 publish_to_robot=loaded_publish_to_robot,
                             )
                             if result.success:
-                                self.on_inference = True
-                                self._publish_inference_phase(InferenceStatus.INFERENCING)
+                                if self._activate_inference_session(
+                                    client, request.task_info
+                                ):
+                                    if not self._publish_inference_phase_if_current(
+                                        client,
+                                        InferenceStatus.INFERENCING,
+                                    ):
+                                        result.success = False
+                                        result.message = (
+                                            'Inference session changed during resume'
+                                        )
+                                else:
+                                    result.success = False
+                                    result.message = (
+                                        'Inference session changed during resume'
+                                    )
                             response.success = result.success
                             response.message = result.message or 'Inference resumed'
                         else:
@@ -1911,6 +2166,14 @@ class OrchestratorNode(Node):
                             response.success = False
                             response.message = 'No inference task info available'
                             return response
+                        if not self._inference_collection_id_for_task(
+                            record_task_info
+                        ):
+                            response.success = False
+                            response.message = (
+                                'Inference must be running before recording starts'
+                            )
+                            return response
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.START,
                             task_info=record_task_info,
@@ -1919,10 +2182,6 @@ class OrchestratorNode(Node):
                         if (cd_result.success
                                 and cd_result.response is not None
                                 and cd_result.response.success):
-                            self._set_session_active(
-                                on_recording=True,
-                                start_time=time.perf_counter(),
-                            )
                             response.success = True
                             response.message = (
                                 cd_result.response.message
@@ -1933,14 +2192,18 @@ class OrchestratorNode(Node):
 
                     elif request.command == SendCommand.Request.STOP_INFERENCE_RECORD:
                         self.get_logger().info('Stopping recording during inference (forwarder)')
-                        cd_result = self._forward_recording(
-                            RecordingCommand.Request.STOP,
-                            task_info=request.task_info,
-                        )
+                        try:
+                            cd_result = forward_inference_record_stop(
+                                request,
+                                self._forward_recording,
+                            )
+                        except (TypeError, ValueError) as exc:
+                            response.success = False
+                            response.message = str(exc)
+                            return response
                         if (cd_result.success
                                 and cd_result.response is not None
                                 and cd_result.response.success):
-                            self._set_session_active(on_recording=False)
                             response.success = True
                             response.message = (
                                 cd_result.response.message or 'Recording saved'
@@ -1962,7 +2225,6 @@ class OrchestratorNode(Node):
                         if (cd_result.success
                                 and cd_result.response is not None
                                 and cd_result.response.success):
-                            self._set_session_active(on_recording=False)
                             response.success = True
                             response.message = (
                                 cd_result.response.message or 'Recording discarded'
@@ -1997,12 +2259,13 @@ class OrchestratorNode(Node):
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.FINISH,
                             task_info=request.task_info,
+                            close_inference_session=is_inference_clear,
                         )
-                        if is_inference_clear:
+                        if (
+                            is_inference_clear
+                            and self._cyclo_data_command_succeeded(cd_result)
+                        ):
                             self._teardown_inference_client()
-                            self._set_session_active(
-                                on_recording=False, on_inference=False,
-                            )
                             if self.timer_manager:
                                 self.timer_manager.stop(timer_name='collection')
                             # Flip UI out of INFERENCING/PAUSED immediately.
@@ -2013,11 +2276,13 @@ class OrchestratorNode(Node):
                                 if (cd_result.response is not None)
                                 else (cd_result.message or 'Inference cleared')
                             )
+                        elif is_inference_clear:
+                            self._restore_inference_session_after_failed_close()
+                            self._apply_cyclo_data_response(cd_result, response)
                         else:
                             if (cd_result.success
                                     and cd_result.response is not None
                                     and cd_result.response.success):
-                                self._set_session_active(on_recording=False)
                                 response.success = True
                                 response.message = (
                                     cd_result.response.message
@@ -2034,19 +2299,21 @@ class OrchestratorNode(Node):
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.RERECORD,
                             task_info=request.task_info,
+                            close_inference_session=snapshot_on_inference,
                         )
-                        self._teardown_inference_client()
-                        self._set_session_active(
-                            on_recording=False, on_inference=False,
-                        )
-                        if self.timer_manager:
-                            self.timer_manager.stop(timer_name='collection')
-                        response.success = True
-                        response.message = (
-                            cd_result.response.message
-                            if (cd_result.response is not None)
-                            else (cd_result.message or 'Recording cancelled')
-                        )
+                        if self._cyclo_data_command_succeeded(cd_result):
+                            if snapshot_on_inference:
+                                self._teardown_inference_client()
+                            if self.timer_manager:
+                                self.timer_manager.stop(timer_name='collection')
+                            response.success = True
+                            response.message = (
+                                cd_result.response.message or 'Recording cancelled'
+                            )
+                        else:
+                            if snapshot_on_inference:
+                                self._restore_inference_session_after_failed_close()
+                            self._apply_cyclo_data_response(cd_result, response)
 
                     elif request.command == SendCommand.Request.CANCEL:
                         # Record-page Discard — drop the active episode
@@ -2063,24 +2330,28 @@ class OrchestratorNode(Node):
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.CANCEL,
                             task_info=request.task_info,
+                            close_inference_session=is_inference_cancel,
                         )
-                        if is_inference_cancel:
-                            self._teardown_inference_client()
-                            self._set_session_active(
-                                on_recording=False, on_inference=False,
+                        if self._cyclo_data_command_succeeded(cd_result):
+                            if is_inference_cancel:
+                                self._teardown_inference_client()
+                                if self.timer_manager:
+                                    self.timer_manager.stop(timer_name='collection')
+                            response.success = True
+                            response.message = (
+                                cd_result.response.message or 'Recording cancelled'
                             )
-                            if self.timer_manager:
-                                self.timer_manager.stop(timer_name='collection')
                         else:
-                            self._set_session_active(on_recording=False)
-                        response.success = True
-                        response.message = (
-                            cd_result.response.message
-                            if (cd_result.response is not None)
-                            else (cd_result.message or 'Recording cancelled')
-                        )
+                            if is_inference_cancel:
+                                self._restore_inference_session_after_failed_close()
+                            self._apply_cyclo_data_response(cd_result, response)
 
         except Exception as e:
+            if (
+                request.command == SendCommand.Request.START_INFERENCE
+                and not inference_reconfiguration_owned_by_worker
+            ):
+                self._end_inference_reconfiguration()
             self.get_logger().error(f'Error in user interaction: {str(e)}')
             response.success = False
             response.message = f'Error in user interaction: {str(e)}'
@@ -2552,30 +2823,37 @@ class OrchestratorNode(Node):
         # Default to groot for backward compatibility
         return '/groot'
 
-    def _teardown_inference_client(self, expected_client=None):
+    def _teardown_inference_client(self, expected_client=None) -> bool:
         """Tear down the container service client (STOP + UNLOAD + disconnect).
 
         Called on inference session end (FINISH), on LOAD/START failure so
         the container is left in a clean state, and before starting a new
         session against a different service prefix. Non-blocking — the
         UNLOAD call happens on a background thread so UI keeps responding
-        while CUDA memory releases.
+        while CUDA memory releases. Returns ``True`` only when this call
+        detached the current lifecycle, allowing callers to publish READY
+        without overwriting a newer client's LOADING/INFERENCING phase.
         """
-        # Atomic swap: detach the client under the lock so concurrent
-        # callers (RESUME path, joystick handler, daemon thread) can't
-        # both grab the same client and double-disconnect.
-        with self._state_lock:
-            client = self.container_service_client
-            if expected_client is not None and client is not expected_client:
-                return
-            self.container_service_client = None
-            self._loaded_inference_policy_path = ''
-            self._loaded_inference_publish_to_robot = False
-            self._loaded_inference_acceleration_mode = 'pytorch'
-            self._loaded_inference_acceleration_engine_path = ''
-            self._loaded_inference_action_request_mode = 'async'
+        # Use the same lock order as _forward_recording. Any in-flight
+        # recording command completes before collection detachment; later
+        # START attempts see no active inference lifecycle.
+        with self._recording_command_lock:
+            with self._state_lock:
+                client = self.container_service_client
+                if expected_client is not None and client is not expected_client:
+                    return False
+                self._inference_session_closing = True
+                self.container_service_client = None
+                self.on_inference = False
+                self._loaded_inference_policy_path = ''
+                self._loaded_inference_publish_to_robot = False
+                self._loaded_inference_acceleration_mode = 'pytorch'
+                self._loaded_inference_acceleration_engine_path = ''
+                self._loaded_inference_action_request_mode = 'async'
+                self._inference_record_collection_id = ''
+                self._inference_session_closing = False
         if client is None:
-            return
+            return True
 
         def _cleanup():
             try:
@@ -2592,6 +2870,7 @@ class OrchestratorNode(Node):
                     pass
 
         threading.Thread(target=_cleanup, daemon=True).start()
+        return True
 
     def _record_trigger_total_segments(self) -> int:
         task_info = self._prepared_record_task_info
@@ -2646,10 +2925,6 @@ class OrchestratorNode(Node):
                 and cd_result.response is not None
                 and cd_result.response.success):
             self._trigger_record_active_segment_index = segment_index
-            self._set_session_active(
-                on_recording=True,
-                start_time=time.perf_counter(),
-            )
             return True
         message = (
             cd_result.response.message
@@ -2684,7 +2959,6 @@ class OrchestratorNode(Node):
             self.get_logger().error(f'Trigger STOP_SEGMENT failed: {message}')
             return
 
-        self._set_session_active(on_recording=False)
         if segment_index >= total - 1:
             self.get_logger().info('Trigger: FINISH_EPISODE')
             finish_result = self._forward_recording(
@@ -2726,7 +3000,6 @@ class OrchestratorNode(Node):
         if (cd_result.success
                 and cd_result.response is not None
                 and cd_result.response.success):
-            self._set_session_active(on_recording=False)
             self._trigger_record_next_segment_index = segment_index
             return
         message = (
@@ -2735,29 +3008,24 @@ class OrchestratorNode(Node):
         )
         self.get_logger().error(f'Trigger CANCEL_SEGMENT failed: {message}')
 
-    def _toggle_inference_trigger_recording(self, is_recording: bool) -> None:
+    def _toggle_inference_trigger_recording(
+        self,
+        is_recording: bool,
+        expected_collection_id: str,
+    ) -> None:
         task_info = self._get_inference_record_task_info()
         if task_info is None:
             self.get_logger().warning(
                 'Inference trigger ignored: no inference task info available')
             return
         if is_recording:
-            self.get_logger().info('Trigger: STOP inference recording')
-            cd_result = self._forward_recording(
-                RecordingCommand.Request.STOP,
-                task_info=task_info,
-            )
-            if (cd_result.success
-                    and cd_result.response is not None
-                    and cd_result.response.success):
-                self._set_session_active(on_recording=False)
-            else:
-                message = (
-                    cd_result.response.message
-                    if cd_result.response is not None else cd_result.message
-                )
-                self.get_logger().error(
-                    f'Trigger inference STOP failed: {message}')
+            # RL collection episodes must be saved through the UI's explicit
+            # Success/Fail controls so every retained episode has an outcome.
+            # A second right press used to issue a bare STOP and silently
+            # archive the episode as ``unlabeled``.
+            self.get_logger().warning(
+                'Inference recording is already active; use Success or Fail '
+                'in RL Data Collect to save it')
             return
 
         self.get_logger().info('Trigger: START inference recording')
@@ -2765,22 +3033,19 @@ class OrchestratorNode(Node):
             RecordingCommand.Request.START,
             task_info=task_info,
             include_topics=True,
+            expected_collection_id=expected_collection_id,
         )
-        if (cd_result.success
-                and cd_result.response is not None
-                and cd_result.response.success):
-            self._set_session_active(
-                on_recording=True,
-                start_time=time.perf_counter(),
-            )
-        else:
+        if not self._cyclo_data_command_succeeded(cd_result):
             message = (
                 cd_result.response.message
                 if cd_result.response is not None else cd_result.message
             )
             self.get_logger().error(f'Trigger inference START failed: {message}')
 
-    def _cancel_inference_trigger_recording(self) -> None:
+    def _cancel_inference_trigger_recording(
+        self,
+        expected_collection_id: str,
+    ) -> None:
         task_info = self._get_inference_record_task_info()
         if task_info is None:
             self.get_logger().warning(
@@ -2790,12 +3055,9 @@ class OrchestratorNode(Node):
         cd_result = self._forward_recording(
             RecordingCommand.Request.CANCEL,
             task_info=task_info,
+            expected_collection_id=expected_collection_id,
         )
-        if (cd_result.success
-                and cd_result.response is not None
-                and cd_result.response.success):
-            self._set_session_active(on_recording=False)
-        else:
+        if not self._cyclo_data_command_succeeded(cd_result):
             message = (
                 cd_result.response.message
                 if cd_result.response is not None else cd_result.message
@@ -2806,7 +3068,9 @@ class OrchestratorNode(Node):
         """
         Handle leader tact triggers as backend-owned recording controls.
 
-        ``right`` toggles start/save. ``left`` cancels the active recording.
+        During inference, ``right`` starts collection and a repeated press is
+        ignored so saving must go through Success/Fail. ``left`` discards the
+        active recording. Record-page segment controls retain toggle behavior.
         """
         self.get_logger().info(f'Joystick trigger: {joystick_mode}')
 
@@ -2816,8 +3080,12 @@ class OrchestratorNode(Node):
             return
 
         if joystick_mode in ('right', 'left'):
-            snapshot_on_recording, snapshot_on_inference = (
-                self._snapshot_session_state()
+            (
+                snapshot_on_recording,
+                snapshot_on_inference,
+                snapshot_collection_id,
+            ) = (
+                self._snapshot_trigger_session_state()
             )
             if snapshot_on_inference:
                 if self._get_inference_record_task_info() is None:
@@ -2825,9 +3093,14 @@ class OrchestratorNode(Node):
                         'Inference trigger ignored: no inference task info available')
                     return
                 if joystick_mode == 'right':
-                    self._toggle_inference_trigger_recording(snapshot_on_recording)
+                    self._toggle_inference_trigger_recording(
+                        snapshot_on_recording,
+                        snapshot_collection_id,
+                    )
                 elif snapshot_on_recording:
-                    self._cancel_inference_trigger_recording()
+                    self._cancel_inference_trigger_recording(
+                        snapshot_collection_id,
+                    )
                 else:
                     self.get_logger().debug(
                         'Inference trigger cancel ignored: no active recording')

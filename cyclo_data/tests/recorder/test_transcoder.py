@@ -761,6 +761,37 @@ class TestRecovery:
         finally:
             worker.shutdown(wait=True)
 
+    def test_c2b_resume_pending_finds_nested_inference_episode(self, tmp_path):
+        final_episode = (
+            tmp_path / "inference" / "ACT_dataset_session_MCAP" / "0"
+        )
+        final_episode.mkdir(parents=True)
+        (final_episode / "episode_info.json").write_text(
+            json.dumps({"transcoding_status": STATUS_PENDING})
+        )
+        temporary_segment = final_episode / "segments" / "0"
+        temporary_segment.mkdir(parents=True)
+        (temporary_segment / "episode_info.json").write_text(
+            json.dumps({"transcoding_status": STATUS_PENDING})
+        )
+        converted_episode = tmp_path / "Task_X_converted" / "0"
+        converted_episode.mkdir(parents=True)
+        (converted_episode / "episode_info.json").write_text(
+            json.dumps({"transcoding_status": STATUS_PENDING})
+        )
+
+        queued = []
+        worker = TranscodeWorker.__new__(TranscodeWorker)
+        worker._log_info = lambda message: None
+        worker.submit = lambda episode_dir, on_complete=None: queued.append(
+            Path(episode_dir)
+        ) or object()
+
+        futures = worker.submit_pending_recovery(tmp_path)
+
+        assert len(futures) == 1
+        assert queued == [final_episode]
+
     def test_c3_failed_status_preserves_raw(self, tmp_path, worker):
         ep = _make_episode(tmp_path, {"cam0": (5, 30)})  # huge mismatch
         worker.submit(ep).result(timeout=60)

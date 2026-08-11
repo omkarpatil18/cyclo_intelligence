@@ -29,6 +29,7 @@ import {
 } from 'react-icons/md';
 import FileBrowserModal from './FileBrowserModal';
 import InferenceModelSelector from './InferenceModelSelector';
+import InferenceRLDataCollectPanel from './InferenceRLDataCollectPanel';
 import PolicyBackendControl from './PolicyBackendControl';
 import TrtEngineControl from './TrtEngineControl';
 import Tooltip from './Tooltip';
@@ -40,6 +41,7 @@ import {
   markInferenceTaskInfoSyncing,
   markInferenceTaskInfoSyncPending,
   markInferenceTaskInfoSyncSuccess,
+  selectInferenceRecordingControl,
   selectInferenceTaskInfo,
   setInferenceMode,
   setInferenceTaskInfo,
@@ -57,6 +59,10 @@ const InferencePanel = () => {
   const taskInfoSync = useSelector((state) => state.tasks.inferenceTaskInfoSync);
   const robotType = useSelector((state) => state.tasks.robotType);
   const inferenceStatus = useSelector((state) => state.tasks.inferenceStatus);
+  const inferenceRecordingControl = useSelector(
+    selectInferenceRecordingControl,
+    shallowEqual
+  );
   const showInstruction = requiresInstruction(info.serviceType, info.policyType);
 
   const [isTaskStatusPaused, setIsTaskStatusPaused] = useState(false);
@@ -71,9 +77,9 @@ const InferencePanel = () => {
   const inferenceMode = info.inferenceMode || 'simulation';
   const isRobotMode = inferenceMode === 'robot';
   const actionRequestMode =
-    String(info.actionRequestMode || '').trim().toLowerCase() === 'sync'
-      ? 'sync'
-      : 'async';
+    String(info.actionRequestMode || '').trim().toLowerCase() === 'async'
+      ? 'async'
+      : 'sync';
   const isGrootModel = info.serviceType === 'groot';
   const isTensorRtEnabled = info.accelerationMode === 'tensorrt_dit';
   const trtTaskInstruction = (info.taskInstruction?.[0] || '').trim();
@@ -175,6 +181,10 @@ const InferencePanel = () => {
   const handleDeployModeChange = useCallback(
     async (mode) => {
       if (mode === inferenceMode || isModeSwitchLocked) return;
+      if (inferenceRecordingControl.lifecycleLocked) {
+        toast.error('Save the recording with Success or Fail before switching deploy target');
+        return;
+      }
 
       if (isModelActive) {
         const result = await sendRecordCommand('finish').catch((error) => {
@@ -194,6 +204,7 @@ const InferencePanel = () => {
     [
       dispatch,
       inferenceMode,
+      inferenceRecordingControl.lifecycleLocked,
       isModeSwitchLocked,
       isModelActive,
       sendRecordCommand,
@@ -235,10 +246,7 @@ const InferencePanel = () => {
     setShowPolicyBrowser(false);
   }, [isEditable, dispatch]);
 
-  const policyBrowserPath =
-    info.serviceType === 'groot'
-      ? DEFAULT_PATHS.GROOT_CHECKPOINTS_PATH
-      : DEFAULT_PATHS.LEROBOT_CHECKPOINTS_PATH;
+  const policyBrowserPath = DEFAULT_PATHS.INFERENCE_CHECKPOINTS_PATH;
 
   // Update isEditable state when the disabled prop changes
   useEffect(() => {
@@ -276,6 +284,8 @@ const InferencePanel = () => {
     'rounded-2xl',
     'shadow-md',
     'p-4',
+    'flex-1',
+    'min-h-0',
     'w-full',
     'max-w-[350px]',
     'relative',
@@ -361,8 +371,10 @@ const InferencePanel = () => {
         : 'bg-emerald-500 text-white focus:ring-emerald-300'
       : 'bg-white text-gray-600 hover:bg-gray-50 focus:ring-gray-300 border border-gray-200',
     {
-      'opacity-50 cursor-not-allowed': isModeSwitchLocked,
-      'cursor-pointer': !isModeSwitchLocked,
+      'opacity-50 cursor-not-allowed':
+        isModeSwitchLocked || inferenceRecordingControl.lifecycleLocked,
+      'cursor-pointer':
+        !isModeSwitchLocked && !inferenceRecordingControl.lifecycleLocked,
     }
   );
 
@@ -419,7 +431,9 @@ const InferencePanel = () => {
           <button
             type="button"
             onClick={() => handleDeployModeChange('simulation')}
-            disabled={isModeSwitchLocked}
+            disabled={
+              isModeSwitchLocked || inferenceRecordingControl.lifecycleLocked
+            }
             className={deployButtonClass(!isRobotMode)}
             aria-label="Use 3D Sim Deploy"
             title="3D Sim Deploy"
@@ -430,7 +444,9 @@ const InferencePanel = () => {
           <button
             type="button"
             onClick={() => handleDeployModeChange('robot')}
-            disabled={isModeSwitchLocked}
+            disabled={
+              isModeSwitchLocked || inferenceRecordingControl.lifecycleLocked
+            }
             className={deployButtonClass(isRobotMode, true)}
             aria-label="Use Real Robot Deploy"
             title="Real Robot Deploy"
@@ -634,6 +650,8 @@ const InferencePanel = () => {
         />
       </div>
 
+      <InferenceRLDataCollectPanel />
+
       <FileBrowserModal
         isOpen={showPolicyBrowser}
         onClose={() => setShowPolicyBrowser(false)}
@@ -644,7 +662,7 @@ const InferencePanel = () => {
         allowFileSelect={false}
         initialPath={policyBrowserPath}
         defaultPath={policyBrowserPath}
-        homePath={DEFAULT_PATHS.POLICY_CHECKPOINTS_PATH}
+        homePath={DEFAULT_PATHS.INFERENCE_CHECKPOINTS_PATH}
       />
     </div>
   );

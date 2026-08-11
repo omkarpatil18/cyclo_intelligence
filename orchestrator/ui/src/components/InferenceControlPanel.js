@@ -32,6 +32,7 @@ import Tooltip from './Tooltip';
 import { InferencePhase } from '../constants/taskPhases';
 import {
   markLocalTaskInfoEdited,
+  selectInferenceRecordingControl,
   selectInferenceTaskInfo,
   setInferenceMode,
   setInferenceStatus,
@@ -80,6 +81,10 @@ export default function InferenceControlPanel() {
   const dispatch = useDispatch();
   const taskInfo = useSelector(selectInferenceTaskInfo, shallowEqual);
   const inferenceStatus = useSelector((state) => state.tasks.inferenceStatus);
+  const inferenceRecordingControl = useSelector(
+    selectInferenceRecordingControl,
+    shallowEqual
+  );
   const rosHost = useSelector((state) => state.ros.rosHost);
 
   const [hovered, setHovered] = useState(null);
@@ -196,6 +201,7 @@ export default function InferenceControlPanel() {
 
   const executeCommand = useCallback(
     async (commandName, commandString, options = {}) => {
+      const shouldResetPhaseAfterFailure = commandString === 'start_inference';
       const isStartTimeoutDuringLoading = (message = '') => (
         commandString === 'start_inference' &&
         String(message).toLowerCase().includes('timeout') &&
@@ -210,15 +216,24 @@ export default function InferenceControlPanel() {
             return result;
           }
           toast.error(`Command failed: ${result.message || 'Unknown error'}`);
-          // Backend may have left phase in LOADING/INFERENCING after a failed
-          // setup; force the local phase back to READY so the panel becomes
-          // editable and the user can retry.
-          dispatch(setInferenceStatus({ inferencePhase: InferencePhase.READY }));
+          // Only a failed fresh START should unlock the editor. Failed Stop,
+          // Clear, or Resume commands leave the existing backend lifecycle
+          // intact; forcing READY there would desynchronise the UI and could
+          // hide an active recording that still needs a label.
+          if (shouldResetPhaseAfterFailure) {
+            dispatch(setInferenceStatus({
+              inferencePhase: InferencePhase.READY,
+            }));
+          }
         } else if (result && result.success === true) {
           toast.success(`${commandName} executed successfully`);
         } else {
           toast.error(`${commandName} completed with uncertain status`);
-          dispatch(setInferenceStatus({ inferencePhase: InferencePhase.READY }));
+          if (shouldResetPhaseAfterFailure) {
+            dispatch(setInferenceStatus({
+              inferencePhase: InferencePhase.READY,
+            }));
+          }
         }
         return result;
       } catch (error) {
@@ -240,7 +255,11 @@ export default function InferenceControlPanel() {
           toast.error(`Command failed [${commandName}]: ${errorMessage}`);
         }
         // Same reasoning as the success===false branch above.
-        dispatch(setInferenceStatus({ inferencePhase: InferencePhase.READY }));
+        if (shouldResetPhaseAfterFailure) {
+          dispatch(setInferenceStatus({
+            inferencePhase: InferencePhase.READY,
+          }));
+        }
         return null;
       }
     },
@@ -342,13 +361,21 @@ export default function InferenceControlPanel() {
   }, [executeCommand]);
 
   const handleClear = useCallback(async () => {
+    if (inferenceRecordingControl.lifecycleLocked) {
+      toast.error('Save the recording with Success or Fail before clearing inference');
+      return;
+    }
     await executeCommand('Clear', 'finish');
     setLastPolicyPath('');
-  }, [executeCommand]);
+  }, [executeCommand, inferenceRecordingControl.lifecycleLocked]);
 
   const startEnabled = shouldCheckBackend && backendReadiness.ready;
   const stopEnabled = isInferencing;
-  const clearEnabled = isModelLoaded;
+  const clearEnabled =
+    isModelLoaded && !inferenceRecordingControl.lifecycleLocked;
+  const clearDescription = inferenceRecordingControl.lifecycleLocked
+    ? 'Save the recording with Success or Fail first'
+    : 'Stop inference and unload model';
   const startDescription = isBackendStartBlocked
     ? backendReadiness.message
     : isPaused
@@ -478,7 +505,7 @@ export default function InferenceControlPanel() {
       color: '#d32f2f',
       enabled: clearEnabled,
       handler: handleClear,
-      description: 'Stop inference and unload model',
+      description: clearDescription,
       shortcut: 'Escape',
     },
   ];

@@ -1,5 +1,6 @@
 import reducer, {
   applyServerTaskInfo,
+  InferenceRecordingUiPhase,
   markInferenceTaskInfoSyncSubmitted,
   markInferenceTaskInfoSyncSuccess,
   markLocalTaskInfoEdited,
@@ -10,14 +11,18 @@ import reducer, {
   ROBOT_TYPE_STORAGE_KEY,
   ROBOT_TYPE_STATUS_GUARD_MS,
   selectInferenceTaskInfo,
+  selectInferenceRecordingControl,
   selectRecordTaskInfo,
   selectRobotType,
   setCameraRecordingMonitor,
   setInferenceMode,
   setInferenceTaskInfo,
+  setInferenceRecordingUiPhase,
   setRecordTaskInfo,
+  setRecordStatus,
   setRecordingMonitor,
 } from './taskSlice';
+import { RecordPhase } from '../../constants/taskPhases';
 import {
   getInferenceTaskInfoKey,
   getRecordTaskInfoKey,
@@ -45,7 +50,8 @@ describe('taskSlice task ownership', () => {
     const inferenceInfo = selectInferenceTaskInfo({ tasks: state });
 
     expect(inferenceInfo.inferenceMode).toBe('simulation');
-    expect(inferenceInfo.actionRequestMode).toBe('async');
+    expect(inferenceInfo.actionRequestMode).toBe('sync');
+    expect(inferenceInfo.controlHz).toBe(15);
     expect(inferenceInfo.accelerationMode).toBe('pytorch');
   });
 
@@ -354,7 +360,7 @@ describe('taskSlice task ownership', () => {
         taskInstruction: ['new prompt'],
         policyPath: '/policy/new',
         serviceType: 'groot',
-        controlHz: 100,
+        controlHz: 15,
         inferenceHz: 15,
         chunkAlignWindowS: 0.3,
       })
@@ -746,5 +752,66 @@ describe('taskSlice recording monitor', () => {
     expect(next.recordingMonitor.topics).toHaveLength(1);
     expect(next.recordingMonitor.cameraTopics).toHaveLength(1);
     expect(next.recordingMonitor.cameraTopics[0].status).toBe(2);
+  });
+});
+
+describe('taskSlice inference recording lifecycle', () => {
+  test('does not let repeated READY status erase a pending start', () => {
+    const initial = reducer(undefined, { type: '@@INIT' });
+    const starting = reducer(
+      initial,
+      setInferenceRecordingUiPhase(InferenceRecordingUiPhase.STARTING)
+    );
+    const next = reducer(
+      starting,
+      setRecordStatus({
+        taskType: '',
+        recordPhase: RecordPhase.READY,
+      })
+    );
+
+    expect(next.inferenceRecordingUi.phase).toBe(
+      InferenceRecordingUiPhase.STARTING
+    );
+  });
+
+  test('keeps a label save single-flight until the server returns READY', () => {
+    const recording = reducer(
+      undefined,
+      setRecordStatus({
+        taskType: 'inference',
+        recordPhase: RecordPhase.RECORDING,
+      })
+    );
+    const stopping = reducer(
+      recording,
+      setInferenceRecordingUiPhase(InferenceRecordingUiPhase.STOPPING)
+    );
+    const repeatedRecording = reducer(
+      stopping,
+      setRecordStatus({
+        taskType: 'inference',
+        recordPhase: RecordPhase.RECORDING,
+      })
+    );
+
+    expect(repeatedRecording.inferenceRecordingUi.phase).toBe(
+      InferenceRecordingUiPhase.STOPPING
+    );
+    expect(selectInferenceRecordingControl({
+      tasks: repeatedRecording,
+    }).lifecycleLocked).toBe(true);
+
+    const ready = reducer(
+      repeatedRecording,
+      setRecordStatus({
+        taskType: '',
+        recordInferenceMode: false,
+        recordPhase: RecordPhase.READY,
+      })
+    );
+    expect(ready.inferenceRecordingUi.phase).toBe(
+      InferenceRecordingUiPhase.IDLE
+    );
   });
 });

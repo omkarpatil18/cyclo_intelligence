@@ -29,6 +29,8 @@ packages = [
     f'{package_name}.reader',
     f'{package_name}.recorder',
     f'{package_name}.services',
+    f'{package_name}.validation',
+    f'{package_name}.validation.scripts',
     f'{package_name}.visualization',
     f'{package_name}.visualization.scripts',
 ]
@@ -80,6 +82,10 @@ setup(
             (
                 'convert_rosbag_to_lerobot = '
                 'cyclo_data.converter.scripts.convert_rosbag_to_lerobot:main'
+            ),
+            (
+                'validate_inference_episode = '
+                'cyclo_data.validation.scripts.validate_inference_episode:main'
             ),
         ],
     },

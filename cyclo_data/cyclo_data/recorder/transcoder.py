@@ -254,7 +254,20 @@ class TranscodeWorker:
         files will be cleaned up at the start of the new attempt.
         """
         episodes: list[Path] = []
-        for info_path in Path(workspace_root).glob("*/[0-9]*/episode_info.json"):
+        root = Path(workspace_root)
+        for info_path in root.rglob('episode_info.json'):
+            episode_dir = info_path.parent
+            if not episode_dir.name.isdigit():
+                continue
+            try:
+                relative_parts = episode_dir.relative_to(root).parts
+            except ValueError:
+                continue
+            if 'segments' in relative_parts or any(
+                part.startswith('.') or part.endswith('_converted')
+                for part in relative_parts
+            ):
+                continue
             try:
                 with open(info_path) as f:
                     info = json.load(f)
@@ -262,7 +275,7 @@ class TranscodeWorker:
                 continue
             status = info.get("transcoding_status")
             if status in (STATUS_PENDING, STATUS_RUNNING):
-                episodes.append(info_path.parent)
+                episodes.append(episode_dir)
         futures: list[Future] = []
         for ep in episodes:
             self._log_info(f"Transcoder resume: queueing {ep}")

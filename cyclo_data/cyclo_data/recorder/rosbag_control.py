@@ -75,10 +75,20 @@ class RosbagControl:
     # High-level commands (mirror orchestrator.Communicator's API)
     # ------------------------------------------------------------------
 
-    def prepare_rosbag(self, topics: List[str]) -> None:
+    def prepare_rosbag(
+        self,
+        topics: List[str],
+        timeout_sec: float = _DEFAULT_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        # PREPARE owns the recorder subscription set.  The caller must not
+        # cache that set until rosbag_recorder has explicitly accepted it;
+        # otherwise a timeout/failure leaves the service believing a stale
+        # subscription inventory is ready and subsequent retries are skipped.
         self._send_rosbag_command(
             command=SendCommand.Request.PREPARE,
             topics=topics,
+            wait_for_response=True,
+            timeout_sec=timeout_sec,
         )
 
     def start_rosbag(
