@@ -299,6 +299,7 @@ export function useRosTopicSubscription() {
           dispatch(
             setRecordStatus({
               taskName: msg.task_info?.task_name || 'idle',
+              taskNum: msg.task_info?.task_num || '',
               taskType: msg.task_info?.task_type || '',
               recordInferenceMode: Boolean(
                 msg.task_info?.record_inference_mode

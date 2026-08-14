@@ -10,7 +10,7 @@ cv_bridge_module = types.ModuleType('cv_bridge')
 cv_bridge_module.CvBridge = Mock
 sys.modules.setdefault('cv_bridge', cv_bridge_module)
 
-from interfaces.msg import TaskInfo
+from interfaces.msg import InferenceStatus, TaskInfo
 from interfaces.srv import RecordingCommand
 
 from orchestrator.orchestrator_node import OrchestratorNode
@@ -34,7 +34,9 @@ def _node():
     node.on_recording = False
     node._loaded_inference_publish_to_robot = True
     node._inference_record_session_id = '20260811_120000'
+    node._inference_record_selected_session_id = None
     node._inference_record_robot_type = 'ffw_sg2_rev1'
+    node._inference_phase = InferenceStatus.INFERENCING
     node._prepared_inference_task_info = _task_info()
     node._last_ui_task_info = None
     node.robot_type = 'ffw_sg2_rev1'
@@ -111,6 +113,54 @@ def test_selected_inference_folder_rejects_missing_and_wrong_robot(
     assert 'do not identify robot_type' in (
         node._inference_record_folder_error(task_info)
     )
+
+
+def test_paused_inference_can_switch_and_clear_recording_folder(
+    monkeypatch,
+    tmp_path,
+):
+    node = _node()
+    node._inference_phase = InferenceStatus.PAUSED
+    node._inference_record_selected_session_id = 'old_session'
+    monkeypatch.setattr(node, 'INFERENCE_RECORD_ROOT', tmp_path)
+    (tmp_path / 'Task_new_session_inference_MCAP').mkdir()
+    task_info = _task_info()
+    task_info.task_num = 'new_session'
+
+    assert node._update_inference_record_session_selection(task_info) is None
+    assert node._inference_record_session_id == 'new_session'
+    assert node._inference_record_selected_session_id == 'new_session'
+
+    monkeypatch.setattr(
+        node,
+        '_new_inference_record_session_id',
+        lambda _root: 'automatic_session',
+    )
+    task_info.task_num = ''
+    assert node._update_inference_record_session_selection(task_info) is None
+    assert node._inference_record_session_id == 'automatic_session'
+    assert node._inference_record_selected_session_id is None
+
+
+def test_running_inference_rejects_folder_change_but_accepts_same_selection(
+    monkeypatch,
+    tmp_path,
+):
+    node = _node()
+    node._inference_phase = InferenceStatus.INFERENCING
+    node._inference_record_selected_session_id = 'current_session'
+    node._inference_record_session_id = 'current_session'
+    monkeypatch.setattr(node, 'INFERENCE_RECORD_ROOT', tmp_path)
+    (tmp_path / 'Task_other_session_inference_MCAP').mkdir()
+    task_info = _task_info()
+    task_info.task_num = 'other_session'
+
+    assert 'only change while inference is stopped' in (
+        node._update_inference_record_session_selection(task_info)
+    )
+
+    task_info.task_num = 'current_session'
+    assert node._update_inference_record_session_selection(task_info) is None
 
 
 def test_simulation_inference_recording_is_rejected():

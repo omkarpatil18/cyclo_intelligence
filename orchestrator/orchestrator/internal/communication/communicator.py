@@ -205,11 +205,9 @@ class Communicator:
             self.get_image_topic_list_callback
         )
 
-        self.file_browser_service = self.node.create_service(
-            BrowseFile,
-            '/browse_file',
-            self.browse_file_callback
-        )
+        # /browse_file is node-scoped and owned by OrchestratorNode. A
+        # Communicator is recreated when robot_type changes, so registering
+        # it here would leave multiple servers replying to the same request.
 
         self.get_dataset_info_service = self.node.create_service(
             GetDatasetInfo,

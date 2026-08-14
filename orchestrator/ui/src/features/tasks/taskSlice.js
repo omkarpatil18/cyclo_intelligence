@@ -339,6 +339,7 @@ const initialState = {
   // record-session state.
   recordStatus: {
     taskName: 'idle',
+    taskNum: '',
     taskType: '',
     recordInferenceMode: false,
     running: false,
@@ -369,6 +370,8 @@ const initialState = {
 
   inferenceRecordingUi: {
     phase: InferenceRecordingUiPhase.IDLE,
+    folderEpisodeCount: 0,
+    folderSessionId: '',
   },
 
   // Inference-side snapshot from /task/inference_status (orchestrator
@@ -447,6 +450,26 @@ const taskSlice = createSlice({
       const previousBusy =
         previousOwned && previousStatus.recordPhase !== RecordPhase.READY;
       const uiPhase = state.inferenceRecordingUi.phase;
+      if (
+        nextOwned &&
+        nextStatus.recordPhase === RecordPhase.RECORDING &&
+        !state.inferenceRecordingUi.folderSessionId &&
+        nextStatus.taskNum
+      ) {
+        state.inferenceRecordingUi.folderSessionId = String(
+          nextStatus.taskNum
+        );
+      }
+      if (
+        nextOwned &&
+        state.inferenceRecordingUi.folderSessionId &&
+        String(nextStatus.taskNum || '') ===
+          state.inferenceRecordingUi.folderSessionId
+      ) {
+        state.inferenceRecordingUi.folderEpisodeCount = Number(
+          nextStatus.currentEpisodeNumber || 0
+        );
+      }
 
       if (
         nextOwned &&
@@ -486,6 +509,16 @@ const taskSlice = createSlice({
       if (Object.values(InferenceRecordingUiPhase).includes(phase)) {
         state.inferenceRecordingUi.phase = phase;
       }
+    },
+    setInferenceRecordingFolderSummary: (state, action) => {
+      const payload = action.payload || {};
+      state.inferenceRecordingUi.folderEpisodeCount = Math.max(
+        0,
+        Number(payload.episodeCount || 0)
+      );
+      state.inferenceRecordingUi.folderSessionId = String(
+        payload.sessionId || ''
+      );
     },
     resetInferenceRecordingUi: (state) => {
       state.inferenceRecordingUi = { ...initialState.inferenceRecordingUi };
@@ -862,9 +895,9 @@ export const selectInferenceRecordingControl = createSelector(
         InferenceRecordingUiPhase.SAVING,
         InferenceRecordingUiPhase.CANCELLING,
       ].includes(uiPhase),
-      episodeCount: serverOwned
-        ? Number(recordStatus.currentEpisodeNumber || 0)
-        : 0,
+      episodeCount: Number(
+        tasks.inferenceRecordingUi?.folderEpisodeCount || 0
+      ),
       serverRecording,
       serverSaving,
       lifecycleLocked:
@@ -882,6 +915,7 @@ export const {
   setRecordStatus,
   resetRecordStatus,
   setInferenceRecordingUiPhase,
+  setInferenceRecordingFolderSummary,
   resetInferenceRecordingUi,
   setInferenceStatus,
   resetInferenceStatus,

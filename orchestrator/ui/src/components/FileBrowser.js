@@ -44,13 +44,14 @@ const formatFileSize = (bytes) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 };
 
-const filterItems = (items, targetFileName, fileFilter) => {
-  if (targetFileName) {
-    return items.filter((item) => item.is_directory);
-  } else if (fileFilter) {
-    return items.filter((item) => item.is_directory || fileFilter(item));
-  }
-  return items;
+const filterItems = (items, targetFileName, fileFilter, directoryFilter) => {
+  return items.filter((item) => {
+    if (item.is_directory) {
+      return !directoryFilter || directoryFilter(item);
+    }
+    if (targetFileName) return false;
+    return !fileFilter || fileFilter(item);
+  });
 };
 const hasTargetFile = (item, targetFileName, targetFolderName, directoriesWithTarget) => {
   return (
@@ -200,6 +201,7 @@ const FileItem = ({
   onSelect,
   allowDirectorySelect = false,
   allowFileSelect = true,
+  directoryFilter = null,
 }) => {
   const classItemContainer = clsx(
     'flex',
@@ -252,7 +254,9 @@ const FileItem = ({
 
   const classArrowIcon = clsx('w-4', 'h-4', 'text-gray-400', 'ml-2');
 
-  const canSelectDirectory = item.is_directory && allowDirectorySelect;
+  const canSelectDirectory = item.is_directory && allowDirectorySelect && (
+    !directoryFilter || directoryFilter(item)
+  );
   const canSelectFile = !item.is_directory && allowFileSelect;
   const showSelectButton = canSelectDirectory || canSelectFile;
 
@@ -479,6 +483,7 @@ export default function FileBrowser({
   defaultPath = null,
   allowDirectorySelect = false,
   allowFileSelect = true,
+  directoryFilter = null,
   multiSelect = false,
   onSelectionChange = null,
 }) {
@@ -635,7 +640,12 @@ export default function FileBrowser({
     [multiSelect, onFileSelect, onDirectorySelect, onSelectionChange]
   );
 
-  const filteredItems = filterItems(items, targetFileName, fileFilter);
+  const filteredItems = filterItems(
+    items,
+    targetFileName,
+    fileFilter,
+    directoryFilter
+  );
 
   useEffect(() => {
     // Prevent multiple initializations
@@ -758,6 +768,7 @@ export default function FileBrowser({
                     onSelect={handleItemSelect}
                     allowDirectorySelect={allowDirectorySelect}
                     allowFileSelect={allowFileSelect}
+                    directoryFilter={directoryFilter}
                   />
                 );
               })}

@@ -50,12 +50,17 @@ const renderPanel = ({
   inferencePhase = InferencePhase.READY,
   recordPhase = RecordPhase.READY,
   taskType = '',
+  datasetEpisodeCount = 0,
 } = {}) => {
   const sendRecordCommand = jest.fn().mockResolvedValue({
     success: true,
     message: 'ok',
   });
-  useRosServiceCaller.mockReturnValue({ sendRecordCommand });
+  const getDatasetInfo = jest.fn().mockResolvedValue({
+    success: true,
+    dataset_info: { episode_count: datasetEpisodeCount },
+  });
+  useRosServiceCaller.mockReturnValue({ getDatasetInfo, sendRecordCommand });
   const initialTasks = taskReducer(undefined, { type: '@@INIT' });
   const store = configureStore({
     reducer: { tasks: taskReducer },
@@ -86,7 +91,7 @@ const renderPanel = ({
       <InferencePanel />
     </Provider>
   );
-  return { sendRecordCommand, store };
+  return { getDatasetInfo, sendRecordCommand, store };
 };
 
 describe('InferencePanel RL Recording', () => {
@@ -115,10 +120,11 @@ describe('InferencePanel RL Recording', () => {
       .toBe(true);
   });
 
-  test('selects and clears an existing RL Recording folder', () => {
+  test('selects and counts an existing RL Recording folder', async () => {
     const { store } = renderPanel({
       inferenceMode: 'robot',
       recordInferenceMode: true,
+      datasetEpisodeCount: 6,
     });
 
     expect(screen.getByText('Automatic new folder')).toBeInTheDocument();
@@ -129,15 +135,33 @@ describe('InferencePanel RL Recording', () => {
       name: /choose select rl recording folder/i,
     }));
 
-    expect(store.getState().tasks.inferenceTaskInfo.recordingFolder).toBe(
-      '/workspace/rosbag2/Task_existing_inference_MCAP'
-    );
+    await waitFor(() => {
+      expect(store.getState().tasks.inferenceTaskInfo.recordingFolder).toBe(
+        '/workspace/rosbag2/Task_existing_inference_MCAP'
+      );
+    });
+    expect(store.getState().tasks.inferenceRecordingUi.folderEpisodeCount)
+      .toBe(6);
     expect(screen.getByText('Task_existing_inference_MCAP')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', {
       name: /clear rl recording folder/i,
     }));
     expect(store.getState().tasks.inferenceTaskInfo.recordingFolder).toBe('');
+    expect(store.getState().tasks.inferenceRecordingUi.folderEpisodeCount)
+      .toBe(0);
+  });
+
+  test('allows changing the RL Recording folder while inference is paused', () => {
+    renderPanel({
+      inferenceMode: 'robot',
+      recordInferenceMode: true,
+      inferencePhase: InferencePhase.PAUSED,
+    });
+
+    expect(screen.getByRole('button', {
+      name: /select rl recording folder/i,
+    })).toBeEnabled();
   });
 
   test('places RL Recording last with a settings divider', () => {

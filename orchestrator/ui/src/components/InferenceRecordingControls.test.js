@@ -43,6 +43,10 @@ const renderControls = ({
           ...initialTasks.inferenceStatus,
           inferencePhase: InferencePhase.INFERENCING,
         },
+        inferenceRecordingUi: {
+          ...initialTasks.inferenceRecordingUi,
+          folderEpisodeCount: currentEpisodeNumber,
+        },
         recordStatus: {
           ...initialTasks.recordStatus,
           taskType: 'inference',

@@ -172,7 +172,9 @@ class OrchestratorNode(Node):
         self._prepared_record_task_info: Optional[TaskInfo] = None
         self._prepared_inference_task_info: Optional[TaskInfo] = None
         self._inference_record_session_id: Optional[str] = None
+        self._inference_record_selected_session_id: Optional[str] = None
         self._inference_record_robot_type: Optional[str] = None
+        self._inference_phase = InferenceStatus.READY
         self._trigger_record_active_segment_index = 0
         self._trigger_record_next_segment_index = 0
 
@@ -493,11 +495,78 @@ class OrchestratorNode(Node):
                     self.INFERENCE_RECORD_ROOT
                 )
             )
+            self._inference_record_selected_session_id = (
+                selected_session_id or None
+            )
             self._inference_record_robot_type = self.robot_type or None
             if task_info is not None:
                 self._prepared_inference_task_info = self._copy_task_info(
                     task_info
                 )
+
+    def _update_inference_record_session_selection(
+        self,
+        task_info: TaskInfo,
+    ) -> Optional[str]:
+        if getattr(task_info, 'task_type', '') != 'inference':
+            return None
+
+        requested_session_id = ''
+        if bool(getattr(task_info, 'record_inference_mode', False)):
+            requested_session_id = str(
+                getattr(task_info, 'task_num', '') or ''
+            ).strip()
+
+        with self._state_lock:
+            previous_selected_id = (
+                getattr(
+                    self,
+                    '_inference_record_selected_session_id',
+                    None,
+                )
+                or ''
+            )
+            recording_active = self.on_recording
+            inference_active = self.on_inference
+            inference_phase = getattr(
+                self,
+                '_inference_phase',
+                InferenceStatus.READY,
+            )
+
+        if requested_session_id == previous_selected_id:
+            return None
+        if recording_active:
+            return 'RL Recording folder cannot change while recording'
+        if inference_phase not in (
+            InferenceStatus.READY,
+            InferenceStatus.PAUSED,
+        ):
+            return 'RL Recording folder can only change while inference is stopped'
+
+        if requested_session_id:
+            selection_error = self._inference_record_folder_error(task_info)
+            if selection_error:
+                return selection_error
+            next_session_id = requested_session_id
+        else:
+            next_session_id = (
+                self._new_inference_record_session_id(
+                    self.INFERENCE_RECORD_ROOT
+                )
+                if inference_active else None
+            )
+
+        with self._state_lock:
+            if self.on_recording:
+                return 'RL Recording folder cannot change while recording'
+            self._inference_record_session_id = next_session_id
+            self._inference_record_selected_session_id = (
+                requested_session_id or None
+            )
+            self._inference_record_robot_type = self.robot_type or None
+            self._prepared_inference_task_info = self._copy_task_info(task_info)
+        return None
 
     def _inference_record_folder_error(
         self,
@@ -694,7 +763,6 @@ class OrchestratorNode(Node):
             ),
             ('/training/get_training_info', GetTrainingInfo, self.get_training_info_callback),
             ('/replay/get_data', GetReplayData, self.get_replay_data_callback),
-            ('/browse_file', BrowseFile, self.browse_file_callback),
         ]
 
         for service_name, service_type, callback in service_definitions:
@@ -702,6 +770,13 @@ class OrchestratorNode(Node):
                 service_type, service_name, callback,
                 callback_group=self._service_cb_group,
             )
+
+        self._file_browser_service = self.create_service(
+            BrowseFile,
+            '/browse_file',
+            self.browse_file_callback,
+            callback_group=self._client_cb_group,
+        )
 
         self.get_logger().info('ROS services initialized successfully')
 
@@ -1032,6 +1107,8 @@ class OrchestratorNode(Node):
         only signals LOADING / INFERENCING / PAUSED / READY on commands.
         Record-side phase lives on /data/recording/status (D18).
         """
+        with self._state_lock:
+            self._inference_phase = int(phase)
         if self.communicator is None:
             return
         robot_type = getattr(self, 'robot_type', '') or ''
@@ -1387,6 +1464,13 @@ class OrchestratorNode(Node):
                     self._apply_cyclo_data_response(cd_result, response)
 
             elif request.command == SendCommand.Request.SET_TASK_INFO:
+                selection_error = self._update_inference_record_session_selection(
+                    request.task_info
+                )
+                if selection_error:
+                    response.success = False
+                    response.message = selection_error
+                    return response
                 self._cache_ui_task_info(request.task_info, 'SET_TASK_INFO')
                 cd_result = self._forward_recording(
                     RecordingCommand.Request.SET_TASK_INFO,
@@ -2014,6 +2098,15 @@ class OrchestratorNode(Node):
                             response.message = 'No inference session active'
 
                     elif request.command == SendCommand.Request.RESUME_INFERENCE:
+                        selection_error = (
+                            self._update_inference_record_session_selection(
+                                request.task_info
+                            )
+                        )
+                        if selection_error:
+                            response.success = False
+                            response.message = selection_error
+                            return response
                         with self._state_lock:
                             client = self.container_service_client
                             loaded_publish_to_robot = (
@@ -2069,6 +2162,15 @@ class OrchestratorNode(Node):
                     elif request.command == SendCommand.Request.START_INFERENCE_RECORD:
                         self.get_logger().info(
                             'Starting recording during inference (forwarder)')
+                        selection_error = (
+                            self._update_inference_record_session_selection(
+                                request.task_info
+                            )
+                        )
+                        if selection_error:
+                            response.success = False
+                            response.message = selection_error
+                            return response
                         start_error = self._inference_record_start_error(
                             request.task_info
                         )
@@ -2791,8 +2893,10 @@ class OrchestratorNode(Node):
             self._loaded_inference_acceleration_engine_path = ''
             self._loaded_inference_action_request_mode = 'async'
             self._inference_record_session_id = None
+            self._inference_record_selected_session_id = None
             self._inference_record_robot_type = None
             self._prepared_inference_task_info = None
+            self._inference_phase = InferenceStatus.READY
         if client is None:
             return
 

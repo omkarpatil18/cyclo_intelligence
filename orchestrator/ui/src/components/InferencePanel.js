@@ -45,6 +45,7 @@ import {
   selectInferenceTaskInfo,
   setInferenceMode,
   setRecordInferenceMode,
+  setInferenceRecordingFolderSummary,
   setInferenceTaskInfo,
 } from '../features/tasks/taskSlice';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
@@ -99,7 +100,7 @@ const InferencePanel = () => {
   const syncGenerationRef = useRef(0);
   const syncTimerRef = useRef(null);
 
-  const { sendRecordCommand } = useRosServiceCaller();
+  const { getDatasetInfo, sendRecordCommand } = useRosServiceCaller();
 
   useEffect(() => {
     if (!isRobotMode && info.recordInferenceMode) {
@@ -255,7 +256,7 @@ const InferencePanel = () => {
     setShowPolicyBrowser(false);
   }, [isEditable, dispatch]);
 
-  const handleRecordingFolderSelect = useCallback((item) => {
+  const handleRecordingFolderSelect = useCallback(async (item) => {
     const fullPath = String(item?.full_path || '').trim();
     if (!getInferenceRecordingSessionId(fullPath)) {
       toast.error(
@@ -263,13 +264,34 @@ const InferencePanel = () => {
       );
       return;
     }
-    dispatch(setInferenceTaskInfo({ recordingFolder: fullPath }));
-    dispatch(markLocalTaskInfoEdited({ source: 'inference' }));
     setShowRecordingFolderBrowser(false);
-  }, [dispatch]);
+    try {
+      const result = await getDatasetInfo(fullPath);
+      if (!result?.success) {
+        throw new Error(result?.message || 'Failed to read dataset');
+      }
+      dispatch(setInferenceTaskInfo({ recordingFolder: fullPath }));
+      dispatch(setInferenceRecordingFolderSummary({
+        episodeCount: Number(result.dataset_info?.episode_count || 0),
+        sessionId: getInferenceRecordingSessionId(fullPath),
+      }));
+      dispatch(markLocalTaskInfoEdited({ source: 'inference' }));
+    } catch (error) {
+      toast.error(error?.message || 'Failed to read RL Recording folder');
+    }
+  }, [dispatch, getDatasetInfo]);
+
+  const isInferenceRecordingFolder = useCallback(
+    (item) => Boolean(getInferenceRecordingSessionId(item?.full_path)),
+    []
+  );
 
   const clearRecordingFolder = useCallback(() => {
     dispatch(setInferenceTaskInfo({ recordingFolder: '' }));
+    dispatch(setInferenceRecordingFolderSummary({
+      episodeCount: 0,
+      sessionId: '',
+    }));
     dispatch(markLocalTaskInfoEdited({ source: 'inference' }));
   }, [dispatch]);
 
@@ -280,7 +302,10 @@ const InferencePanel = () => {
   const recordingFolderName = getInferenceRecordingFolderName(
     info.recordingFolder
   );
-  const recordingFolderLocked = !isEditable || recordingControl.lifecycleLocked;
+  const recordingFolderLocked = ![
+    InferencePhase.READY,
+    InferencePhase.PAUSED,
+  ].includes(inferenceStatus.inferencePhase) || recordingControl.lifecycleLocked;
 
   // Update isEditable state when the disabled prop changes
   useEffect(() => {
@@ -763,6 +788,7 @@ const InferencePanel = () => {
         selectButtonText="Use Folder"
         allowDirectorySelect={true}
         allowFileSelect={false}
+        directoryFilter={isInferenceRecordingFolder}
         initialPath={DEFAULT_PATHS.ROSBAG2_PATH}
         defaultPath={DEFAULT_PATHS.ROSBAG2_PATH}
         homePath={DEFAULT_PATHS.ROSBAG2_PATH}

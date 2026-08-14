@@ -10,14 +10,18 @@ import reducer, {
   ROBOT_TYPE_STORAGE_KEY,
   ROBOT_TYPE_STATUS_GUARD_MS,
   selectInferenceTaskInfo,
+  selectInferenceRecordingControl,
   selectRecordTaskInfo,
   selectRobotType,
   setCameraRecordingMonitor,
   setInferenceMode,
+  setInferenceRecordingFolderSummary,
   setInferenceTaskInfo,
   setRecordTaskInfo,
+  setRecordStatus,
   setRecordingMonitor,
 } from './taskSlice';
+import { RecordPhase } from '../../constants/taskPhases';
 import {
   getInferenceTaskInfoKey,
   getRecordTaskInfoKey,
@@ -657,6 +661,66 @@ describe('taskSlice robot type session state', () => {
 });
 
 describe('taskSlice recording progress', () => {
+  test('shows a selected folder count before recording starts', () => {
+    const state = reducer(
+      undefined,
+      setInferenceRecordingFolderSummary({
+        episodeCount: 8,
+        sessionId: 'selected_session',
+      })
+    );
+
+    expect(selectInferenceRecordingControl({ tasks: state }).episodeCount)
+      .toBe(8);
+  });
+
+  test('updates the selected folder count after a saved rollout', () => {
+    let state = reducer(
+      undefined,
+      setInferenceRecordingFolderSummary({
+        episodeCount: 8,
+        sessionId: 'selected_session',
+      })
+    );
+    state = reducer(state, setRecordStatus({
+      taskType: 'inference',
+      recordInferenceMode: true,
+      recordPhase: RecordPhase.RECORDING,
+      taskNum: 'selected_session',
+      currentEpisodeNumber: 8,
+    }));
+    state = reducer(state, setRecordStatus({
+      taskType: 'inference',
+      recordInferenceMode: true,
+      recordPhase: RecordPhase.READY,
+      taskNum: 'selected_session',
+      currentEpisodeNumber: 9,
+    }));
+
+    expect(selectInferenceRecordingControl({ tasks: state }).episodeCount)
+      .toBe(9);
+  });
+
+  test('ignores recording status from a different folder session', () => {
+    let state = reducer(
+      undefined,
+      setInferenceRecordingFolderSummary({
+        episodeCount: 8,
+        sessionId: 'selected_session',
+      })
+    );
+    state = reducer(state, setRecordStatus({
+      taskType: 'inference',
+      recordInferenceMode: true,
+      recordPhase: RecordPhase.READY,
+      taskNum: 'previous_session',
+      currentEpisodeNumber: 3,
+    }));
+
+    expect(selectInferenceRecordingControl({ tasks: state }).episodeCount)
+      .toBe(8);
+  });
+
   test('resets saved segment progress when applying a server task', () => {
     const initial = reducer(undefined, { type: '@@INIT' });
     const serverTaskInfo = {

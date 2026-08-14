@@ -14,7 +14,7 @@
 //
 // Author: Kiwoong Park
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import clsx from 'clsx';
 import { MdClose, MdFolderOpen } from 'react-icons/md';
 import FileBrowser from './FileBrowser';
@@ -29,6 +29,7 @@ export default function FileBrowserModal({
   selectButtonText = 'Select',
   allowDirectorySelect = false,
   allowFileSelect = true,
+  directoryFilter = null,
   targetFileName = null,
   targetFolderName = null,
   targetFileLabel = null,
@@ -39,6 +40,20 @@ export default function FileBrowserModal({
   const [selectedItem, setSelectedItem] = useState(null);
   const [multiSelectedItems, setMultiSelectedItems] = useState([]);
   const [currentPath, setCurrentPath] = useState(initialPath);
+  const currentDirectoryItem = useMemo(() => ({
+    name: currentPath.split('/').pop() || currentPath,
+    full_path: currentPath,
+    is_directory: true,
+    size: -1,
+    modified_time: '',
+  }), [currentPath]);
+  const canSelectCurrentDirectory = Boolean(
+    allowDirectorySelect &&
+    currentPath &&
+    !targetFileName &&
+    !targetFolderName &&
+    (!directoryFilter || directoryFilter(currentDirectoryItem))
+  );
 
   const handleFileSelect = useCallback((item) => {
     if (!multiSelect) {
@@ -69,24 +84,16 @@ export default function FileBrowserModal({
       onFileSelect(selectedItem);
       onClose();
       setSelectedItem(null);
-    } else if (allowDirectorySelect && currentPath && !targetFileName && !targetFolderName) {
-      onFileSelect({
-        name: currentPath.split('/').pop() || currentPath,
-        full_path: currentPath,
-        is_directory: true,
-        size: -1,
-        modified_time: '',
-      });
+    } else if (canSelectCurrentDirectory) {
+      onFileSelect(currentDirectoryItem);
       onClose();
     }
   }, [
     multiSelect,
     multiSelectedItems,
     selectedItem,
-    currentPath,
-    allowDirectorySelect,
-    targetFileName,
-    targetFolderName,
+    canSelectCurrentDirectory,
+    currentDirectoryItem,
     onFileSelect,
     onClose,
   ]);
@@ -218,6 +225,7 @@ export default function FileBrowserModal({
               defaultPath={defaultPath}
               allowDirectorySelect={allowDirectorySelect}
               allowFileSelect={allowFileSelect}
+              directoryFilter={directoryFilter}
               multiSelect={multiSelect}
               onSelectionChange={handleMultiSelectionChange}
             />
@@ -240,7 +248,7 @@ export default function FileBrowserModal({
                   <span className={classLabel}>Selected:</span>
                   <span className={classValue}>{selectedItem.name}</span>
                 </div>
-              ) : allowDirectorySelect && currentPath && !targetFileName && !targetFolderName ? (
+              ) : canSelectCurrentDirectory ? (
                 <div className={classStatusRow}>
                   <MdFolderOpen className={classIcon} />
                   <span className={classLabel}>Current Directory:</span>
@@ -272,7 +280,7 @@ export default function FileBrowserModal({
                     ? multiSelectedItems.length === 0
                     : targetFileName || targetFolderName
                       ? !(selectedItem && selectedItem.is_directory)
-                      : (!selectedItem && !(allowDirectorySelect && currentPath)) ||
+                      : (!selectedItem && !canSelectCurrentDirectory) ||
                         (selectedItem && selectedItem.is_directory && !allowDirectorySelect) ||
                         (selectedItem && !selectedItem.is_directory && !allowFileSelect)
                 }
