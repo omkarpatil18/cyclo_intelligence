@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from typing import Dict, Iterable
 
 from .constants import IMAGE_KEY_PREFIX as _IMAGE_KEY_PREFIX
@@ -52,10 +53,14 @@ class IoMappingMixin:
         # but not consumed by the policy are silently ignored — same
         # behavior as GR00TInference.
         policy_image_keys = self._policy_image_keys()
-        active = self._resolve_camera_mappings(
-            self._robot.camera_names,
-            policy_image_keys,
-        )
+        if self._policy_is_state_only():
+            # Proprioception-only policy: don't subscribe/forward cameras.
+            active: Dict[str, str] = {}
+        else:
+            active = self._resolve_camera_mappings(
+                self._robot.camera_names,
+                policy_image_keys,
+            )
         if not active and policy_image_keys:
             raise RuntimeError(
                 "No cameras match the policy's expected input keys: "
@@ -120,6 +125,16 @@ class IoMappingMixin:
             return {k for k in features.keys() if k.startswith(_IMAGE_KEY_PREFIX)}
         except Exception:
             return set()
+
+    def _policy_is_state_only(self) -> bool:
+        """True when the policy declares inputs but none of them are images."""
+        try:
+            features = getattr(self._policy.config, "input_features", None)
+        except Exception:
+            return False
+        if not isinstance(features, Mapping) or not features:
+            return False
+        return not any(str(k).startswith(_IMAGE_KEY_PREFIX) for k in features)
 
     @classmethod
     def _resolve_camera_mappings(

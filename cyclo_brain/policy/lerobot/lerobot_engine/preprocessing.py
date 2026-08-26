@@ -31,8 +31,8 @@ class PreprocessingMixin:
         """Pull raw sensor data from RobotClient and build a policy batch."""
         assert self._robot is not None
 
-        images = self._robot.get_images(format="rgb")
-        if not images:
+        images = self._robot.get_images(format="rgb") if self._cameras else {}
+        if self._cameras and not images:
             return self._fail("No camera frames available")
 
         joint_dict = self._robot.get_joint_positions()

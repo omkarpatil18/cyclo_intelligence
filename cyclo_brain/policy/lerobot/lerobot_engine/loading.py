@@ -29,6 +29,7 @@ from typing import Any, Dict, Tuple
 
 import torch
 
+from .diffusion_compat import allow_state_only_diffusion
 from .image_preprocessing import infer_image_resize_targets
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -74,6 +75,10 @@ class LoadingMixin:
             policy_type = "act"
 
         logger.info("Policy type: %s", policy_type)
+        if policy_type == "diffusion":
+            # Proprioception-only diffusion checkpoints fail upstream's
+            # validate_features() inside __init__ unless relaxed first.
+            allow_state_only_diffusion()
         PolicyClass = get_policy_class(policy_type)
 
         # FastWAM's text encoder must stay on the CPU. Its default config can

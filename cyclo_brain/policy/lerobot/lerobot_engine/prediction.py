@@ -14,6 +14,8 @@ from typing import Dict
 import numpy as np
 import torch
 
+from .diffusion_compat import expand_obs_time_dim, is_diffusion_config
+
 
 logger = logging.getLogger("lerobot_engine")
 
@@ -24,6 +26,13 @@ class PredictionMixin:
     def _predict_chunk(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Return a chunk tensor of shape (1, T, A)."""
         assert self._policy is not None
+        config = self._policy.config
+        if is_diffusion_config(config):
+            # Offline predict_action_chunk expects (B, n_obs_steps, ...)
+            # observations; the engine builds a single (B, ...) one.
+            batch = expand_obs_time_dim(
+                batch, getattr(config, "n_obs_steps", 1)
+            )
         try:
             action = self._policy.predict_action_chunk(batch)
             if action.dim() == 2:
