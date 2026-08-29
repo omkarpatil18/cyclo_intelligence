@@ -23,3 +23,13 @@ services:
       - PYTHONPATH=/lerobot/src
     volumes:
       - ../cyclo_brain/policy/lerobot/lerobot:/lerobot:ro
+
+  # Live-edit the Isaac-GR00T library (cyclo_brain/policy/groot/Isaac-GR00T
+  # submodule). The image installs it EDITABLE at /gr00t, so no PYTHONPATH change
+  # is needed -- but /gr00t also holds the container's .venv, so mount ONLY the
+  # gr00t/ package dir, never the whole tree. groot_engine/ and runtime/ are
+  # already mounted by the base compose file. Restart the backend after edits;
+  # recreate the container ONCE after adding this (mounts bind at creation).
+  groot:
+    volumes:
+      - ../cyclo_brain/policy/groot/Isaac-GR00T/gr00t:/gr00t/gr00t:ro
