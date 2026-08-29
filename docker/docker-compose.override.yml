@@ -10,3 +10,16 @@ services:
       resources:
         reservations:
           devices: !reset []
+
+  # Live-edit the LeRobot library (cyclo_brain/policy/lerobot/lerobot submodule)
+  # without rebuilding the image: mount the source tree at its canonical
+  # in-image location (/lerobot, where the Dockerfile COPYs it) and put its
+  # src/ ahead of the baked site-packages copy on the import path. The s6 run
+  # scripts append a pre-existing PYTHONPATH. Code is imported once per process:
+  # after editing, use the UI "Restart" (docker restart) and LOAD again.
+  # Recreate the container ONCE after adding this (mounts bind at creation).
+  lerobot:
+    environment:
+      - PYTHONPATH=/lerobot/src
+    volumes:
+      - ../cyclo_brain/policy/lerobot/lerobot:/lerobot:ro
