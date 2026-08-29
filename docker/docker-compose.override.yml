@@ -31,5 +31,9 @@ services:
   # already mounted by the base compose file. Restart the backend after edits;
   # recreate the container ONCE after adding this (mounts bind at creation).
   groot:
+    environment:
+      # Request the next action chunk earlier (buffered time < margin + measured
+      # inference latency) to avoid stalls at chunk boundaries. Default 0.2.
+      - REFILL_MARGIN_S=0.4
     volumes:
       - ../cyclo_brain/policy/groot/Isaac-GR00T/gr00t:/gr00t/gr00t:ro
