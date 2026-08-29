@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, Iterable
+from collections.abc import Mapping
+from typing import Dict, Iterable, List
 
 from .constants import IMAGE_KEY_PREFIX as _IMAGE_KEY_PREFIX
 
@@ -95,7 +96,7 @@ class IoMappingMixin:
             modalities = sorted(set(modalities) | {"mobile"})
 
         self._state_modalities = modalities
-        self._action_keys = list(modalities)
+        self._action_keys = self._policy_action_keys(modalities)
 
         # Block until at least one frame from each sensor lands. 10 s is
         # generous — typical hardware comes up in <2 s.
@@ -106,6 +107,43 @@ class IoMappingMixin:
             self._state_modalities,
         )
 
+    def _policy_action_keys(self, modalities: List[str]) -> List[str]:
+        """Leading action groups whose widths add up to the policy's action dim.
+
+        A policy trained on a subset of the robot's action topics (e.g. arms
+        only) must not command the remaining groups; ``publish_action`` slices
+        the flat action vector by these keys in order, so the prefix must sum
+        exactly to what the policy emits.
+        """
+        try:
+            action_dim = int(self._policy.config.output_features["action"].shape[0])
+        except Exception:
+            return list(modalities)
+        keys: List[str] = []
+        total = 0
+        for key in modalities:
+            if total >= action_dim:
+                break
+            keys.append(key)
+            total += self._action_width(key)
+        if total != action_dim:
+            raise RuntimeError(
+                f"Policy action dim {action_dim} does not match robot action "
+                f"groups {modalities} (matched {keys} = {total})"
+            )
+        if keys != list(modalities):
+            logger.info("Policy commands %s only (action dim %d)", keys, action_dim)
+        return keys
+
+    def _action_width(self, action_key: str) -> int:
+        """Width ``RobotClient.publish_action`` consumes for one action key."""
+        cfg = self._robot._action_groups.get(self._robot._resolve_action_key(action_key))
+        if cfg is None:
+            return 0
+        if cfg.get("msg_type") == "geometry_msgs/msg/Twist":
+            return 3
+        return len(cfg.get("joint_names", []))
+
     def _teardown_robot(self) -> None:
         if self._robot is not None:
             try:
@@ -115,11 +153,30 @@ class IoMappingMixin:
             self._robot = None
 
     def _policy_image_keys(self) -> set:
+        """Image keys the engine must feed, expressed as camera names.
+
+        A checkpoint fine-tuned with ``--rename_map`` keeps the base model's
+        slot names (e.g. ``observation.images.camera1``) in ``input_features``
+        and stores the camera-name -> slot-name map in its saved preprocessor.
+        The preprocessor applies that rename at inference, so the engine must
+        resolve robot cameras against the map's *source* keys.
+        """
         try:
             features = getattr(self._policy.config, "input_features", {}) or {}
-            return {k for k in features.keys() if k.startswith(_IMAGE_KEY_PREFIX)}
+            keys = {k for k in features.keys() if k.startswith(_IMAGE_KEY_PREFIX)}
         except Exception:
             return set()
+        slot_to_camera = {v: k for k, v in self._preprocessor_rename_map().items()}
+        return {slot_to_camera.get(k, k) for k in keys}
+
+    def _preprocessor_rename_map(self) -> Dict[str, str]:
+        """Return the saved ``rename_observations_processor`` map, if any."""
+        preprocessor = getattr(self, "_preprocessor", None)
+        for step in getattr(preprocessor, "steps", None) or []:
+            rename_map = getattr(step, "rename_map", None)
+            if isinstance(rename_map, Mapping):
+                return dict(rename_map)
+        return {}
 
     @classmethod
     def _resolve_camera_mappings(

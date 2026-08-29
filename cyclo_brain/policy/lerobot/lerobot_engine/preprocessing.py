@@ -25,6 +25,25 @@ logger = logging.getLogger("lerobot_engine")
 
 
 class PreprocessingMixin:
+
+    def _expected_state_dim(self, default: int) -> int:
+        """State width the loaded policy normalizes with.
+
+        The saved normalizer's ``observation.state`` stats are computed from
+        the fine-tuning dataset and are authoritative. ``config.input_features``
+        is only a fallback: on a ``--policy.path`` fine-tune LeRobot keeps the
+        base checkpoint's shape there (e.g. 6 for smolvla_base).
+        """
+        preprocessor = getattr(self, "_preprocessor", None)
+        for step in getattr(preprocessor, "steps", None) or []:
+            stats = (getattr(step, "stats", None) or {}).get(_STATE_KEY) or {}
+            mean = stats.get("mean")
+            if mean is not None:
+                return int(mean.numel() if torch.is_tensor(mean) else np.size(mean))
+        try:
+            return int(self._policy.config.input_features[_STATE_KEY].shape[0])
+        except Exception:
+            return default
     """RobotClient observation -> policy input batch."""
 
     def _build_observation(self, task_instruction: str) -> Dict[str, Any]:
@@ -85,12 +104,7 @@ class PreprocessingMixin:
         # TODO(ROBOTIS): replace zero-padding with real values. Some training
         # datasets carry extra state dimensions (e.g. EE pose) that the current
         # robot_config joint topics do not surface.
-        try:
-            expected = int(
-                self._policy.config.input_features[_STATE_KEY].shape[0]
-            )
-        except Exception:
-            expected = flat_state.size
+        expected = self._expected_state_dim(default=flat_state.size)
         if flat_state.size < expected:
             pad = np.zeros(expected - flat_state.size, dtype=np.float32)
             logger.warning(
