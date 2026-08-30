@@ -44,12 +44,21 @@ import torch
 # /robot_client_sdk/ is the bind-mount root; the package itself sits at
 # /robot_client_sdk/robot_client/ so the parent dir goes onto sys.path.
 _ROBOT_CLIENT_PATH = os.environ.get("ROBOT_CLIENT_SDK_PATH", "/robot_client_sdk")
+
+# Lottery-ticket noise selection (https://arxiv.org/abs/2603.15757), switchable at
+# runtime without restarting the engine. The file is re-read only when its mtime changes.
+#   file missing        -> gr00t_n1d7.noise_idx is left untouched (source default governs)
+#   empty / "none"      -> random noise every call (default GR00T behaviour)
+#   integer k           -> fixed noise ticket k (seeded with k, shared across batch)
+# Host path: docker/workspace/noise_idx.txt  ->  e.g.  echo 2 > docker/workspace/noise_idx.txt
+NOISE_IDX_FILE = os.environ.get("GROOT_NOISE_IDX_FILE", "/workspace/noise_idx.txt")
 if os.path.exists(_ROBOT_CLIENT_PATH) and _ROBOT_CLIENT_PATH not in sys.path:
     sys.path.insert(0, _ROBOT_CLIENT_PATH)
 
 import gr00t.model  # noqa: F401 - register custom models
 from gr00t.data.embodiment_tags import EmbodimentTag  # noqa: E402
 from gr00t.policy.gr00t_policy import Gr00tPolicy  # noqa: E402
+import gr00t.model.gr00t_n1d7.gr00t_n1d7 as gr00t_n1d7  # noqa: E402 - noise_idx global
 from robot_client import RobotClient  # noqa: E402
 from robot_client.camera_mapping import resolve_camera_feature_sources  # noqa: E402
 
@@ -716,6 +725,30 @@ class GR00TInference:
 
         self.logger.info("Robot info: %s", self.robot_info)
 
+    def _sync_noise_idx(self) -> None:
+        """Apply NOISE_IDX_FILE to gr00t_n1d7.noise_idx if the file changed (~2us via stat)."""
+        try:
+            mtime = os.stat(NOISE_IDX_FILE).st_mtime_ns
+        except FileNotFoundError:
+            return  # no override file: leave gr00t_n1d7.noise_idx as-is
+        if mtime == getattr(self, "_noise_idx_mtime", None):
+            return
+        self._noise_idx_mtime = mtime
+
+        try:
+            with open(NOISE_IDX_FILE) as f:
+                text = f.read().strip()
+            value = None if (not text or text.lower() == "none") else int(text)
+        except (OSError, ValueError) as e:
+            self.logger.warning(
+                "Ignoring %s (%s); keeping noise_idx=%s", NOISE_IDX_FILE, e, gr00t_n1d7.noise_idx
+            )
+            return
+
+        if value != gr00t_n1d7.noise_idx:
+            gr00t_n1d7.noise_idx = value
+            self.logger.info("GR00T noise_idx set to %s (from %s)", value, NOISE_IDX_FILE)
+
     def get_action_chunk(self, request) -> dict:
         """Build observation from RobotClient, run inference, return action chunk."""
         if not self.is_ready:
@@ -729,6 +762,9 @@ class GR00TInference:
             observation = self.preprocess(images, joints, task)
             if "success" in observation:
                 return observation
+
+            # Lottery-ticket noise sweep: uncomment to follow /workspace/noise_idx.txt live.
+            # self._sync_noise_idx()
 
             t0 = time.monotonic()
             self.logger.info("Running GR00T inference...")
