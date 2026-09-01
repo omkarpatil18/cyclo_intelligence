@@ -61,6 +61,11 @@ from gr00t.policy.gr00t_policy import Gr00tPolicy  # noqa: E402
 import gr00t.model.gr00t_n1d7.gr00t_n1d7 as gr00t_n1d7  # noqa: E402 - noise_idx global
 from robot_client import RobotClient  # noqa: E402
 from robot_client.camera_mapping import resolve_camera_feature_sources  # noqa: E402
+from runtime.composition import (  # noqa: E402
+    GrootScoreComposer,
+    combine_actions,
+    load_composite_spec,
+)
 
 try:
     from hf_token_sync import sync_token_file  # noqa: E402
@@ -245,6 +250,9 @@ class GR00TInference:
         self.policy: Optional[Gr00tPolicy] = None
         self.robot: Optional[RobotClient] = None
         self._loaded_model_path: Optional[str] = None  # track cached policy path
+        # Set when a composite model dir (composite.json) is loaded:
+        # {'policies': [Gr00tPolicy, ...], 'weights': [...]} (stitch mode).
+        self._composite: Optional[dict] = None
         self._loaded_acceleration_mode: str = ACCELERATION_PYTORCH
         self._loaded_acceleration_engine_path: str = ""
         self.policy_info: dict = {
@@ -319,6 +327,7 @@ class GR00TInference:
                     self.robot.close()
                     self.robot = None
                 self.policy = None
+                self._composite = None
                 self._loaded_model_path = None
                 self._loaded_acceleration_mode = ACCELERATION_PYTORCH
                 self._loaded_acceleration_engine_path = ""
@@ -330,11 +339,49 @@ class GR00TInference:
             )
             self._sync_hf_token_for_gated_backbones()
 
-            self.policy = Gr00tPolicy(
-                embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
-                model_path=model_path,
-                device="cuda",
-            )
+            spec = load_composite_spec(model_path)
+            if spec is not None:
+                comp_mode = spec.get("mode", "stitch")
+                if comp_mode not in ("stitch", "joint"):
+                    raise RuntimeError(
+                        f"GR00T composition mode must be 'stitch' or 'joint', got {comp_mode!r}"
+                    )
+                if acceleration_mode == ACCELERATION_TENSORRT_DIT:
+                    self.logger.info(
+                        "Composite GR00T: TensorRT not supported; using PyTorch"
+                    )
+                    acceleration_mode = ACCELERATION_PYTORCH
+                    acceleration_engine_path = ""
+                self.logger.info(
+                    "Composite GR00T (%s): %d models, weights=%s",
+                    comp_mode, len(spec["models"]), spec["weights"],
+                )
+                policies = [
+                    Gr00tPolicy(
+                        embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+                        model_path=mp,
+                        device="cuda",
+                    )
+                    for mp in spec["models"]
+                ]
+                self.policy = policies[0]
+                self._composite = {
+                    "mode": comp_mode,
+                    "policies": policies,
+                    "weights": spec["weights"],
+                    "composer": (
+                        GrootScoreComposer(policies, spec["weights"])
+                        if comp_mode == "joint"
+                        else None
+                    ),
+                }
+            else:
+                self._composite = None
+                self.policy = Gr00tPolicy(
+                    embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+                    model_path=model_path,
+                    device="cuda",
+                )
 
             self.init_policy_info()
             self.init_robot_info(robot_type)
@@ -768,7 +815,21 @@ class GR00TInference:
 
             t0 = time.monotonic()
             self.logger.info("Running GR00T inference...")
-            action, info = self.policy.get_action(observation)
+            if self._composite is not None:
+                if self._composite["composer"] is not None:  # joint / score mode
+                    action = self._composite["composer"].get_action(observation)
+                else:  # stitch / output mode
+                    action_dicts = []
+                    for pol in self._composite["policies"]:
+                        a, _info = pol.get_action(observation)
+                        action_dicts.append(a)
+                    action = combine_actions(
+                        action_dicts,
+                        self._composite["weights"],
+                        list(self.policy_info["action"]),
+                    )
+            else:
+                action, info = self.policy.get_action(observation)
             self.logger.info("GR00T inference completed in %.3fs", time.monotonic() - t0)
             return self.postprocess_action(action)
 

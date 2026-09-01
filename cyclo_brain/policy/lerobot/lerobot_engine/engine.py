@@ -84,6 +84,12 @@ from .optimization import OptimizationMixin  # noqa: E402
 from .io_mapping import IoMappingMixin  # noqa: E402
 from .preprocessing import PreprocessingMixin  # noqa: E402
 from .prediction import PredictionMixin  # noqa: E402
+from .composition import (  # noqa: E402
+    SmolVLAComposer,
+    load_composite_spec,
+    zero_state,
+    zero_state_flag,
+)
 
 
 logger = logging.getLogger("lerobot_engine")
@@ -103,6 +109,12 @@ class LeRobotEngine(
         self._policy: Optional[PreTrainedPolicy] = None
         self._preprocessor = None
         self._postprocessor = None
+        # Set when a composite model dir (composite.json) is loaded:
+        # {'composer': SmolVLAComposer, 'preprocessors': [...]}.
+        self._composite = None
+        # True when the loaded checkpoint was trained with zeroed state
+        # (noproprio): observation.state is zeroed after preprocessing.
+        self._zero_state = False
         self._robot: Optional[RobotClient] = None
         self._device: Optional[torch.device] = None
         self._loaded_model_path: Optional[str] = None
@@ -164,14 +176,52 @@ class LeRobotEngine(
                 self._device = torch.device(
                     "cuda" if torch.cuda.is_available() else "cpu"
                 )
-                policy, preprocessor, postprocessor = self._load_policy_assets(
-                    model_path, self._device
-                )
-                self._policy = policy
-                self._preprocessor = preprocessor
-                self._postprocessor = postprocessor
-                self._loaded_model_path = model_path
-                self._apply_policy_optimization(model_path, request)
+                spec = load_composite_spec(model_path)
+                if spec is not None:
+                    logger.info(
+                        "Composite policy: %d models, weights=%s",
+                        len(spec["models"]), spec["weights"],
+                    )
+                    assets = [
+                        self._load_policy_assets(mp, self._device)
+                        for mp in spec["models"]
+                    ]
+                    self._policy = assets[0][0]
+                    self._preprocessor = assets[0][1]
+                    self._postprocessor = assets[0][2]
+                    self._composite = {
+                        "composer": SmolVLAComposer(
+                            [a[0] for a in assets],
+                            [a[2] for a in assets],
+                            spec["weights"],
+                            mode=spec.get("mode", "joint"),
+                        ),
+                        "preprocessors": [a[1] for a in assets],
+                        "zero_state": [
+                            zero_state_flag(mp) for mp in spec["models"]
+                        ],
+                    }
+                    if any(self._composite["zero_state"]):
+                        logger.info(
+                            "Composite zero-state (noproprio) flags: %s",
+                            self._composite["zero_state"],
+                        )
+                    self._loaded_model_path = model_path
+                    # torch.compile / acceleration is per-policy; not applied
+                    # to composites.
+                else:
+                    self._composite = None
+                    policy, preprocessor, postprocessor = self._load_policy_assets(
+                        model_path, self._device
+                    )
+                    self._policy = policy
+                    self._preprocessor = preprocessor
+                    self._postprocessor = postprocessor
+                    self._loaded_model_path = model_path
+                    self._zero_state = zero_state_flag(model_path)
+                    if self._zero_state:
+                        logger.info("noproprio checkpoint: feeding zeroed observation.state")
+                    self._apply_policy_optimization(model_path, request)
 
             self._init_robot(robot_type)
             self._loaded_robot_type = robot_type
@@ -200,8 +250,24 @@ class LeRobotEngine(
                 return obs
 
             with torch.inference_mode():
-                preprocessed = self._preprocessor(obs)
-                action = self._predict_chunk(preprocessed)
+                if self._composite is not None:
+                    batches = []
+                    for pre, zs in zip(
+                        self._composite["preprocessors"],
+                        self._composite["zero_state"],
+                    ):
+                        b = pre(dict(obs))
+                        if zs:
+                            b = zero_state(b)
+                        batches.append(b)
+                    action = self._composite["composer"].predict_action_chunk(
+                        batches
+                    )
+                else:
+                    preprocessed = self._preprocessor(obs)
+                    if self._zero_state:
+                        preprocessed = zero_state(preprocessed)
+                    action = self._predict_chunk(preprocessed)
                 action = self._postprocessor(action)
 
             chunk = self._to_numpy_chunk(action)
@@ -235,6 +301,8 @@ class LeRobotEngine(
         self._policy = None
         self._preprocessor = None
         self._postprocessor = None
+        self._composite = None
+        self._zero_state = False
         self._device = None
         self._loaded_model_path = None
         self._loaded_robot_type = None
