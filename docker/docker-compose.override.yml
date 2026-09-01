@@ -34,6 +34,6 @@ services:
     environment:
       # Request the next action chunk earlier (buffered time < margin + measured
       # inference latency) to avoid stalls at chunk boundaries. Default 0.2.
-      - REFILL_MARGIN_S=0.4
+      - REFILL_MARGIN_S=0.2
     volumes:
       - ../cyclo_brain/policy/groot/Isaac-GR00T/gr00t:/gr00t/gr00t:ro
