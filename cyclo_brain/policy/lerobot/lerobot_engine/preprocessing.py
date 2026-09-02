@@ -122,9 +122,33 @@ class PreprocessingMixin:
                 expected,
             )
             flat_state = flat_state[:expected]
-        batch[_STATE_KEY] = (
-            torch.from_numpy(flat_state).unsqueeze(0).to(self._device)
-        )
+        state = torch.from_numpy(flat_state).unsqueeze(0).to(self._device)
+
+        # Some policies want an observation-step axis on the state: Diffusion Policy
+        # reads `batch_size, n_obs_steps = state.shape[:2]` and then asserts that
+        # n_obs_steps matches its config, so a plain (B, D) tensor makes it read the
+        # state dimension as the step count and raise AssertionError. ACT projects the
+        # state directly and needs (B, D), so this must not be applied blindly.
+        # SmolVLA accepts either -- it takes [:, -1, :] when ndim > 2.
+        #
+        # We serve one live frame, so it is repeated n_obs_steps times, matching the
+        # warm-up behaviour of the policies' own select_action queues.
+        n_obs = self._state_obs_steps()
+        if n_obs is not None:
+            state = state.unsqueeze(1).expand(-1, n_obs, -1).contiguous()
+
+        batch[_STATE_KEY] = state
 
         batch["task"] = [task_instruction or ""]
         return batch
+
+    def _state_obs_steps(self) -> int | None:
+        """n_obs_steps if this policy expects a stepped state tensor, else None."""
+        cfg = getattr(self._policy, "config", None)
+        if cfg is None:
+            return None
+        # Keyed on policy type rather than the presence of n_obs_steps: SmolVLA also
+        # declares n_obs_steps but does not require the axis, and ACT breaks with it.
+        if getattr(cfg, "type", None) != "diffusion":
+            return None
+        return int(getattr(cfg, "n_obs_steps", 1) or 1)
