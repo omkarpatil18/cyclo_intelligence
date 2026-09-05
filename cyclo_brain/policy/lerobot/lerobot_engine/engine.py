@@ -85,8 +85,8 @@ from .io_mapping import IoMappingMixin  # noqa: E402
 from .preprocessing import PreprocessingMixin  # noqa: E402
 from .prediction import PredictionMixin  # noqa: E402
 from .composition import (  # noqa: E402
-    SmolVLAComposer,
     load_composite_spec,
+    make_composer,
     zero_state,
     zero_state_flag,
 )
@@ -110,7 +110,7 @@ class LeRobotEngine(
         self._preprocessor = None
         self._postprocessor = None
         # Set when a composite model dir (composite.json) is loaded:
-        # {'composer': SmolVLAComposer, 'preprocessors': [...]}.
+        # {'composer': from make_composer(), 'preprocessors': [...]}.
         self._composite = None
         # True when the loaded checkpoint was trained with zeroed state
         # (noproprio): observation.state is zeroed after preprocessing.
@@ -190,7 +190,7 @@ class LeRobotEngine(
                     self._preprocessor = assets[0][1]
                     self._postprocessor = assets[0][2]
                     self._composite = {
-                        "composer": SmolVLAComposer(
+                        "composer": make_composer(
                             [a[0] for a in assets],
                             [a[2] for a in assets],
                             spec["weights"],

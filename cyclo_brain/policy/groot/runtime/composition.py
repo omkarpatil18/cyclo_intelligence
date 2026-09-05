@@ -13,8 +13,9 @@ saved processor), and the finished chunks are combined per action dimension:
 layout (concatenation of the policy's action modality keys, e.g. arm_left(8)
 + arm_right(8)); scalars broadcast over all dims.
 
-Joint (score/velocity) composition is NOT implemented for GR00T yet — it
-requires refactoring the flow-matching loop in gr00t_n1d7.py.
+Joint (score/velocity) composition IS implemented as well: see
+``GrootScoreComposer`` below (shared trajectory in the normalized action
+space, per-step velocity combination via Gr00tN1d7ActionHead.velocity_step).
 """
 from __future__ import annotations
 
@@ -118,7 +119,7 @@ class _Captured(Exception):
 
 def _capture_collated_inputs(policy, observation) -> dict:
     """Run the policy's native preprocessing (processor + collate + dtype cast)
-    and capture the kwargs that would be passed to model.get_action."""
+    and capture the flat model-input dict passed into model.get_action."""
     captured = []
     original = policy.model.get_action
 
@@ -137,10 +138,8 @@ def _capture_collated_inputs(policy, observation) -> dict:
         raise RuntimeError("failed to capture GR00T model inputs")
     args, kwargs = captured[0]
     # Gr00tPolicy calls self.model.get_action(**collated) where the collator
-    # wraps everything as {"inputs": <flat dict>} (see Gr00tN1d7DataCollator:
-    # ``return BatchFeature(data={"inputs": batch})``), so the flat model-input
-    # dict arrives as the ``inputs`` kwarg. Unwrap exactly the way the call
-    # binds to ``Gr00tN1d7.get_action(self, inputs, options=None)``.
+    # wraps everything as {"inputs": <flat dict>} — unwrap exactly the way the
+    # call binds to ``Gr00tN1d7.get_action(self, inputs, options=None)``.
     if "inputs" in kwargs:
         return kwargs["inputs"]
     if args:
@@ -148,38 +147,16 @@ def _capture_collated_inputs(policy, observation) -> dict:
     return kwargs
 
 
-def _action_affine(policy, pad_dim: int):
-    """Per-dim (scale, shift) mapping normalized [-1,1] -> physical, from the
-    policy's q01/q99 (or min/max) action stats. Padded dims are identity."""
-    tag = policy.embodiment_tag.value
-    sap = policy.processor.state_action_processor
-    groups = sap.modality_configs[tag]["action"].modality_keys
-    scale = np.ones(pad_dim, dtype=np.float32)
-    shift = np.zeros(pad_dim, dtype=np.float32)
-    off = 0
-    for g in groups:
-        params = sap.norm_params[tag]["action"][g]
-        lo = np.asarray(params["min"], dtype=np.float32).flatten()
-        hi = np.asarray(params["max"], dtype=np.float32).flatten()
-        d = lo.size
-        scale[off:off + d] = np.maximum((hi - lo) / 2.0, 1e-8)
-        shift[off:off + d] = (hi + lo) / 2.0
-        off += d
-    return scale, shift, off  # off == real action dim
-
-
 class GrootScoreComposer:
     """Score (velocity) composition across N Gr00tPolicy instances.
 
-    Shared trajectory kept in PHYSICAL action space; per policy the view is
-    converted with its own min-max affine (x_norm = (x_phys - shift)/scale),
-    velocities converted back (v_phys = v_norm * scale) and combined per-dim:
-    v = sum_i w_i[d] * v_phys_i[d]. Initial noise uses the ownership-weighted
-    prior. Views are clamped to +/-3 in normalized space (decode clips to
-    [-1,1] at the end regardless).
+    NAIVE composition: one shared trajectory in the normalized action space
+    (policies are assumed to share normalization — for checkpoints with
+    differing stats this is knowingly inconsistent and accepted). Plain
+    N(0,1) initial noise (honors the lottery-ticket noise_idx); per step
+    v = sum_i w_i[d] * v_i, x <- x + dt * v; the finished chunk is decoded
+    with the PRIMARY policy's saved processor.
     """
-
-    VIEW_CLAMP = 3.0
 
     def __init__(self, policies: List[Any], weights: List[Any]):
         if len(policies) < 2:
@@ -196,11 +173,14 @@ class GrootScoreComposer:
         self.horizon = int(head0.config.action_horizon)
         self.num_steps = int(head0.num_inference_timesteps)
 
-        affines = [_action_affine(p, self.pad_dim) for p in policies]
-        real_dim = affines[0][2]
-        self.scales = [a[0] for a in affines]
-        self.shifts = [a[1] for a in affines]
-
+        # Per-dim weight vectors (scalars broadcast; vectors cover the real
+        # action dim, padded dims get 1/N).
+        tag = policies[0].embodiment_tag.value
+        sap = policies[0].processor.state_action_processor
+        groups = sap.modality_configs[tag]["action"].modality_keys
+        real_dim = int(sum(
+            sap.norm_params[tag]["action"][g]["dim"].item() for g in groups
+        ))
         n = len(policies)
         vecs = []
         for w in weights:
@@ -215,21 +195,22 @@ class GrootScoreComposer:
                 vec = np.full(self.pad_dim, 1.0 / n, dtype=np.float32)
                 vec[:real_dim] = v
                 vecs.append(vec)
+        colsum = np.sum([v[:real_dim] for v in vecs], axis=0)
+        if not np.allclose(colsum, 1.0, atol=1e-3):
+            logger.warning(
+                "Composite weights do not sum to 1 per dim (min %.3f max %.3f) — using as given",
+                float(colsum.min()), float(colsum.max()),
+            )
         self.w = vecs
-        # Ownership-weighted initial prior (per-dim; zero columns -> equal).
-        wstack = np.stack(vecs)
-        colsum = np.clip(np.abs(wstack).sum(axis=0), 1e-6, None)
-        share = np.abs(wstack) / colsum
-        self.init_scale = sum(s * sc for s, sc in zip(share, self.scales))
-        self.init_shift = sum(s * sh for s, sh in zip(share, self.shifts))
         logger.info(
-            "GrootScoreComposer: %d policies, steps=%d, horizon=%d, pad_dim=%d, "
-            "real_dim=%d", n, self.num_steps, self.horizon, self.pad_dim, real_dim,
+            "GrootScoreComposer (naive): %d policies, steps=%d, horizon=%d, "
+            "pad_dim=%d, real_dim=%d", n, self.num_steps, self.horizon,
+            self.pad_dim, real_dim,
         )
 
     @torch.no_grad()
     def get_action(self, observation) -> Dict[str, np.ndarray]:
-        # 1) Native preprocessing per policy, then conditioning (backbone runs once).
+        # 1) Native preprocessing + conditioning per policy (backbone once each).
         conds = []
         device = None
         dtype = None
@@ -245,45 +226,36 @@ class GrootScoreComposer:
                 (model.action_head, feats, action_inputs.embodiment_id, backbone_outputs)
             )
 
-        # 2) Initial noise (honors the lottery-ticket noise_idx), lifted to
-        #    physical space with the ownership-weighted prior.
+        # 2) Plain N(0,1) initial noise in the shared normalized space
+        #    (same lottery-ticket semantics as single-policy inference).
+        # Same dtype conventions as get_action_with_features (backbone dtype).
         shape = (1, self.horizon, self.pad_dim)
         if _gr00t_n1d7.noise_idx is None:
-            noise = torch.randn(shape, dtype=torch.float32, device=device)
+            x_t = torch.randn(shape, dtype=dtype, device=device)
         else:
             g = torch.Generator(device=device).manual_seed(int(_gr00t_n1d7.noise_idx))
-            noise = torch.randn(shape, dtype=torch.float32, device=device, generator=g)
-        t_scales = [torch.as_tensor(s, device=device) for s in self.scales]
-        t_shifts = [torch.as_tensor(s, device=device) for s in self.shifts]
-        t_w = [torch.as_tensor(w, device=device) for w in self.w]
-        init_scale = torch.as_tensor(self.init_scale, device=device)
-        init_shift = torch.as_tensor(self.init_shift, device=device)
-        x_phys = noise * init_scale + init_shift
+            x_t = torch.randn(shape, dtype=dtype, device=device, generator=g)
+        t_w = [torch.as_tensor(w, device=device, dtype=dtype) for w in self.w]
 
-        # 3) Shared Euler loop, weighted velocity combination in physical space.
+        # 3) Shared Euler loop: v = sum_i w_i * v_i.
         dt = 1.0 / self.num_steps
         for t_index in range(self.num_steps):
-            v_phys = torch.zeros_like(x_phys)
-            for (head, feats, emb_id, bb_out), sc, sh, wv in zip(
-                conds, t_scales, t_shifts, t_w
-            ):
-                x_view = torch.clamp(
-                    (x_phys - sh) / sc, -self.VIEW_CLAMP, self.VIEW_CLAMP
-                ).to(dtype)
-                v = head.velocity_step(
-                    actions=x_view,
+            v = torch.zeros_like(x_t)
+            for (head, feats, emb_id, bb_out), wv in zip(conds, t_w):
+                v_i = head.velocity_step(
+                    actions=x_t,
                     t_index=t_index,
                     backbone_features=feats.backbone_features,
                     state_features=feats.state_features,
                     embodiment_id=emb_id,
                     backbone_output=bb_out,
                 )
-                v_phys = v_phys + wv * (v.float() * sc)
-            x_phys = x_phys + dt * v_phys
+                v = v + wv * v_i
+            x_t = x_t + dt * v
 
-        # 4) Back to the PRIMARY policy's normalized space; decode with its
-        #    saved processor (clips to [-1,1], splits per group, unnormalizes).
-        x0_norm0 = ((x_phys - t_shifts[0]) / t_scales[0]).float().cpu().numpy()
+        # 4) Decode with the PRIMARY policy's saved processor.
         p0 = self.policies[0]
-        unnorm = p0.processor.decode_action(x0_norm0, p0.embodiment_tag, None)
+        unnorm = p0.processor.decode_action(
+            x_t.float().cpu().numpy(), p0.embodiment_tag, None
+        )
         return {k: v.astype(np.float32) for k, v in unnorm.items()}
